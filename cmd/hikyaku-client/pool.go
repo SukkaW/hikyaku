@@ -12,56 +12,67 @@ import (
 )
 
 const (
-	dialTimeout = 10 * time.Second
-	minBackoff  = time.Second
-	maxBackoff  = 30 * time.Second
+	dialTimeout  = 5 * time.Second
+	minBackoff   = time.Second
+	maxBackoff   = 5 * time.Second
+	suspectAfter = 5 * time.Second
+	healthCheck  = 500 * time.Millisecond
 )
 
 var errNoCarrier = errors.New("no carrier is ready")
+
+type carrier struct {
+	session *smux.Session
+	conn    *proxy.Conn
+}
 
 // pool keeps a fixed set of pre-opened carriers; a slot is nil while its carrier is down.
 type pool struct {
 	server   string
 	psk      []byte
 	mu       sync.Mutex
-	sessions []*smux.Session
+	carriers []*carrier
 }
 
 func newPool(server string, psk []byte, carriers int) *pool {
-	p := &pool{server: server, psk: psk, sessions: make([]*smux.Session, carriers)}
-	for slot := range p.sessions {
+	p := &pool{server: server, psk: psk, carriers: make([]*carrier, carriers)}
+	for slot := range p.carriers {
 		go p.maintain(slot)
 	}
 	return p
 }
 
 func (p *pool) maintain(slot int) {
-	backoff := minBackoff
+	var backoff time.Duration
 	for {
-		session, err := p.dial()
+		c, err := p.dial()
 		if err != nil {
 			log.Printf("carrier %d: %v", slot, err)
+			backoff = min(max(2*backoff, minBackoff), maxBackoff)
 			time.Sleep(backoff)
-			backoff = min(2*backoff, maxBackoff)
 			continue
 		}
-		backoff = minBackoff
-		p.set(slot, session)
+		backoff = 0
+		p.set(slot, c)
 		log.Printf("carrier %d: ready", slot)
-		<-session.CloseChan()
+		silent := c.watch()
 		p.set(slot, nil)
-		log.Printf("carrier %d: closed", slot)
-		time.Sleep(backoff)
+		if silent {
+			log.Printf("carrier %d: silent, replacing", slot)
+			go c.drain()
+		} else {
+			log.Printf("carrier %d: closed", slot)
+		}
 	}
 }
 
-func (p *pool) set(slot int, session *smux.Session) {
+func (p *pool) set(slot int, c *carrier) {
 	p.mu.Lock()
-	p.sessions[slot] = session
+	p.carriers[slot] = c
 	p.mu.Unlock()
 }
 
-func (p *pool) dial() (*smux.Session, error) {
+func (p *pool) dial() (*carrier, error) {
 	conn, err := net.DialTimeout("tcp", p.server, dialTimeout)
 	if err != nil {
 		return nil, err
@@ -78,20 +89,55 @@ func (p *pool) dial() (*smux.Session, error) {
 		conn.Close()
 		return nil, err
 	}
-	return session, nil
+	return &carrier{session: session, conn: c}, nil
+}
+
+// watch reports true once the carrier has received nothing for suspectAfter,
+// and false if its session closes first.
+func (c *carrier) watch() bool {
+	tick := time.NewTicker(healthCheck)
+	defer tick.Stop()
+	for {
+		select {
+		case <-c.session.CloseChan():
+			return false
+		case <-tick.C:
+			if time.Since(c.conn.LastRead()) >= suspectAfter {
+				return true
+			}
+		}
+	}
+}
+
+// drain lets a silent carrier finish its existing streams, which survive a short
+// outage; if the server never returns, smux's keepalive timeout closes it instead.
+func (c *carrier) drain() {
+	tick := time.NewTicker(healthCheck)
+	defer tick.Stop()
+	for {
+		select {
+		case <-c.session.CloseChan():
+			return
+		case <-tick.C:
+			if c.session.NumStreams() == 0 {
+				c.session.Close()
+				return
+			}
+		}
+	}
 }
 
 func (p *pool) openStream() (*smux.Stream, error) {
 	p.mu.Lock()
-	var best *smux.Session
-	for _, s := range p.sessions {
-		if s != nil && !s.IsClosed() && (best == nil || s.NumStreams() < best.NumStreams()) {
-			best = s
+	var best *carrier
+	for _, c := range p.carriers {
+		if c != nil && !c.session.IsClosed() && (best == nil || c.session.NumStreams() < best.session.NumStreams()) {
+			best = c
 		}
 	}
 	p.mu.Unlock()
 	if best == nil {
 		return nil, errNoCarrier
 	}
-	return best.OpenStream()
+	return best.session.OpenStream()
 }

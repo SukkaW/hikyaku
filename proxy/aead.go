@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -83,6 +84,8 @@ type Conn struct {
 	seal      cipher.AEAD
 	sealNonce [12]byte
 	wbuf      []byte
+
+	lastRead atomic.Int64 // unix nanoseconds of the last authenticated chunk
 }
 
 // ClientHandshake sends the client salt and hello, then waits for the server's
@@ -170,6 +173,11 @@ func newAEAD(psk, salt []byte, info string) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
+// LastRead reports when the peer's most recent chunk arrived.
+func (c *Conn) LastRead() time.Time {
+	return time.Unix(0, c.lastRead.Load())
+}
+
 func (c *Conn) Read(b []byte) (int, error) {
 	if len(c.pending) == 0 {
 		p, err := c.readChunk()
@@ -233,6 +241,7 @@ func (c *Conn) readChunk() ([]byte, error) {
 		return nil, err
 	}
 	increment(&c.openNonce)
+	c.lastRead.Store(time.Now().UnixNano())
 	return plain, nil
 }
 

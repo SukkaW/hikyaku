@@ -66,7 +66,7 @@ func startClient(t *testing.T, server string, psk []byte) *socks.Client {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		p.mu.Lock()
-		ready := p.sessions[0] != nil && p.sessions[1] != nil
+		ready := p.carriers[0] != nil && p.carriers[1] != nil
 		p.mu.Unlock()
 		if ready {
 			break
