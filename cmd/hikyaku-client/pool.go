@@ -22,6 +22,10 @@ const (
 	healthCheck  = 500 * time.Millisecond
 	carrierWait  = 10 * time.Second
 	carrierPoll  = 50 * time.Millisecond
+	pongTimeout  = 3 * time.Second
+	slowMargin   = time.Second
+	slowStrikes  = 3
+	metricsEvery = 30 * time.Second
 )
 
 var (
@@ -79,12 +83,23 @@ func (p *pool) maintain(slot int) {
 		c.slot = slot
 		p.set(slot, c)
 		log.Printf("carrier %d: ready", slot)
-		silent := c.watch()
+		v := p.watch(c)
+		silent := v == silent || v == noPong
 		switch {
+		case v == slow:
+			p.toStandby(c)
+			c.moveUnanswered()
+			log.Printf("carrier %d: %s slower than the best other carrier for %d heartbeats after %s, standing by",
+				slot, slowMargin, slowStrikes, c.lifetime())
+			go p.retire(c)
 		case silent && c.conn.Acked():
 			p.toStandby(c)
 			c.moveUnanswered()
-			log.Printf("carrier %d: silent for %s after %s, standing by", slot, suspectAfter, c.lifetime())
+			if v == noPong {
+				log.Printf("carrier %d: pong overdue by %s after %s, standing by", slot, pongTimeout, c.lifetime())
+			} else {
+				log.Printf("carrier %d: silent for %s after %s, standing by", slot, suspectAfter, c.lifetime())
+			}
 			go p.retire(c)
 		case silent:
 			// Never acknowledged, so it has not proven it reaches the server; failing
@@ -154,21 +169,102 @@ func (c *carrier) silent() bool {
 	return time.Since(c.conn.LastRead()) >= suspectAfter
 }
 
-// watch reports true once the carrier has received nothing for suspectAfter,
-// and false if its session closes first.
-func (c *carrier) watch() bool {
+func (c *carrier) pongOverdue() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, opened := range c.waiting {
+		if time.Since(opened) >= pongTimeout {
+			return true
+		}
+	}
+	return false
+}
+
+type verdict int
+
+const (
+	closed verdict = iota
+	silent
+	noPong
+	slow
+)
+
+// watch reports why a carrier should leave its slot: its session closed, it went
+// silent, a stream's pong is overdue, or it stayed clearly slower than the best
+// other carrier for slowStrikes heartbeats in a row.
+func (p *pool) watch(c *carrier) verdict {
 	tick := time.NewTicker(healthCheck)
 	defer tick.Stop()
+	var strikes int
+	lastBeat, lastLog := time.Now(), time.Now()
 	for {
 		select {
 		case <-c.session.CloseChan():
-			return false
+			return closed
 		case <-tick.C:
 			if c.silent() {
-				return true
+				return silent
+			}
+			if c.pongOverdue() {
+				return noPong
+			}
+			if time.Since(lastBeat) >= proxy.KeepAliveInterval {
+				lastBeat = time.Now()
+				if p.slower(c) {
+					strikes++
+				} else {
+					strikes = 0
+				}
+				if strikes >= slowStrikes {
+					return slow
+				}
+			}
+			if time.Since(lastLog) >= metricsEvery {
+				lastLog = time.Now()
+				log.Printf("carrier %d: rtt %s, heartbeat lag %s, %d streams",
+					c.slot, time.Duration(c.rtt.Load()).Round(time.Millisecond),
+					c.conn.HeartbeatLag().Round(time.Millisecond), c.session.NumStreams())
 			}
 		}
 	}
+}
+
+// slower reports whether c's delay exceeds the best other acknowledged carrier's by
+// slowMargin. Delay is the larger of the heartbeat lag and how far the carrier's
+// pong round trip sits above the fastest one; with no other carrier, nothing is slow.
+func (p *pool) slower(c *carrier) bool {
+	if !c.conn.Acked() {
+		return false
+	}
+	p.mu.Lock()
+	var others []*carrier
+	for _, o := range p.carriers {
+		if o != nil && o != c && o.conn.Acked() && !o.session.IsClosed() {
+			others = append(others, o)
+		}
+	}
+	p.mu.Unlock()
+	if len(others) == 0 {
+		return false
+	}
+	fastest := time.Duration(c.rtt.Load())
+	for _, o := range others {
+		if rtt := time.Duration(o.rtt.Load()); rtt != 0 && (fastest == 0 || rtt < fastest) {
+			fastest = rtt
+		}
+	}
+	delay := func(x *carrier) time.Duration {
+		d := x.conn.HeartbeatLag()
+		if rtt := time.Duration(x.rtt.Load()); rtt != 0 {
+			d = max(d, rtt-fastest)
+		}
+		return d
+	}
+	best := delay(others[0])
+	for _, o := range others[1:] {
+		best = min(best, delay(o))
+	}
+	return delay(c)-best >= slowMargin
 }
 
 // retire keeps a standby carrier for its existing streams, which survive a short

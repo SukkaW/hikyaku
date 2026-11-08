@@ -77,6 +77,7 @@ type Conn struct {
 
 	lastRead atomic.Int64 // unix nanoseconds of the last authenticated chunk
 	readErr  atomic.Pointer[error]
+	beats    heartbeat
 }
 
 // ClientHandshake sends the client salt and hello and returns at once, so streams
@@ -161,6 +162,12 @@ func (c *Conn) LastRead() time.Time {
 // Acked reports whether the server has acknowledged a client handshake.
 func (c *Conn) Acked() bool {
 	return c.acked.Load()
+}
+
+// HeartbeatLag estimates queueing on the path from the peer: how late its latest
+// keepalive arrived relative to the earliest ones' schedule.
+func (c *Conn) HeartbeatLag() time.Duration {
+	return c.beats.current()
 }
 
 // ReadErr returns the first error the carrier hit while reading, if any.
@@ -271,6 +278,9 @@ func (c *Conn) readChunk() ([]byte, error) {
 	}
 	increment(&c.openNonce)
 	c.lastRead.Store(time.Now().UnixNano())
+	if len(plain) == 8 && plain[1] == smuxNOP {
+		c.beats.observe(time.Now())
+	}
 	return plain, nil
 }
 
