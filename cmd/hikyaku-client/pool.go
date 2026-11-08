@@ -64,11 +64,18 @@ func (p *pool) maintain(slot int) {
 		p.set(slot, c)
 		log.Printf("carrier %d: ready", slot)
 		silent := c.watch()
-		if silent {
+		switch {
+		case silent && c.conn.Acked():
 			p.toStandby(c)
 			log.Printf("carrier %d: silent for %s after %s, standing by", slot, suspectAfter, c.lifetime())
 			go p.retire(c)
-		} else {
+		case silent:
+			// Never acknowledged, so it has not proven it reaches the server; failing
+			// its streams now lets apps retry instead of waiting on a dead standby.
+			p.set(slot, nil)
+			c.session.Close()
+			log.Printf("carrier %d: no acknowledgement after %s, closing", slot, c.lifetime())
+		default:
 			p.set(slot, nil)
 			log.Printf("carrier %d: closed after %s: %s", slot, c.lifetime(), c.closeReason())
 		}
@@ -193,12 +200,12 @@ func (p *pool) pick() *carrier {
 	defer p.mu.Unlock()
 	best := fewestStreams(p.carriers, func(c *carrier) bool { return c.conn.Acked() })
 	if best == nil {
-		best = fewestStreams(p.carriers, nil)
+		// A standby carrier takes new streams only once it is receiving again; that
+		// proves more than a new carrier still waiting for its acknowledgement.
+		best = fewestStreams(p.standby, func(c *carrier) bool { return !c.silent() })
 	}
 	if best == nil {
-		// A standby carrier takes new streams only once it is receiving again, and
-		// only while no active carrier is usable.
-		best = fewestStreams(p.standby, func(c *carrier) bool { return !c.silent() })
+		best = fewestStreams(p.carriers, nil)
 	}
 	return best
 }
