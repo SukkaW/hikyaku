@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -22,14 +21,13 @@ import (
 	"github.com/sagernet/sing/protocol/socks"
 )
 
-func startServer(t *testing.T, psk []byte) string {
+func startServer(t *testing.T, psk string) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "hikyaku-server")
 	if out, err := exec.Command("go", "build", "-o", bin, "github.com/SukkaW/hikyaku/cmd/hikyaku-server").CombinedOutput(); err != nil {
 		t.Fatalf("build server: %v\n%s", err, out)
 	}
-	cmd := exec.Command(bin, "-listen", "127.0.0.1:0", "-allow-private")
-	cmd.Env = append(os.Environ(), proxy.PSKEnv+"="+base64.StdEncoding.EncodeToString(psk))
+	cmd := exec.Command(bin, "-listen", "127.0.0.1:0", "-allow-private", "-psk", psk)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -86,9 +84,10 @@ func startClient(t *testing.T, server string, psk []byte) *socks.Client {
 }
 
 func TestEndToEnd(t *testing.T) {
-	psk := make([]byte, proxy.PSKSize)
-	rand.Read(psk)
-	client := startClient(t, startServer(t, psk), psk)
+	key := make([]byte, proxy.PSKSize)
+	rand.Read(key)
+	psk := base64.StdEncoding.EncodeToString(key)
+	client := startClient(t, startServer(t, psk), []byte(psk))
 
 	t.Run("fetch", func(t *testing.T) {
 		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

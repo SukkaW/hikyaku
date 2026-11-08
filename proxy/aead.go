@@ -7,20 +7,17 @@ import (
 	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	PSKEnv  = "HIKYAKU_PSK"
 	PSKSize = 32
 
 	saltSize     = 32
@@ -31,17 +28,6 @@ const (
 )
 
 var ErrReplay = errors.New("replayed or stale handshake")
-
-func PSKFromEnv() ([]byte, error) {
-	psk, err := base64.StdEncoding.DecodeString(os.Getenv(PSKEnv))
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", PSKEnv, err)
-	}
-	if len(psk) != PSKSize {
-		return nil, fmt.Errorf("%s must be %d bytes encoded in base64, got %d bytes", PSKEnv, PSKSize, len(psk))
-	}
-	return psk, nil
-}
 
 // ReplayFilter remembers client salts for as long as their hello timestamp is acceptable.
 type ReplayFilter struct {

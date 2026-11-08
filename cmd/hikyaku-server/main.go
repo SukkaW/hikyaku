@@ -17,27 +17,27 @@ const handshakeTimeout = 10 * time.Second
 
 func main() {
 	listen := flag.String("listen", ":8444", "carrier listen address")
+	psk := flag.String("psk", "", "pre-shared key, any string")
 	allowPrivate := flag.Bool("allow-private", false, "allow loopback, private, link-local, multicast and unspecified destinations")
 	genkey := flag.Bool("genkey", false, "print a new random PSK and exit")
 	flag.Parse()
 
 	if *genkey {
-		psk := make([]byte, proxy.PSKSize)
-		rand.Read(psk)
-		fmt.Println(base64.StdEncoding.EncodeToString(psk))
+		key := make([]byte, proxy.PSKSize)
+		rand.Read(key)
+		fmt.Println(base64.StdEncoding.EncodeToString(key))
 		return
 	}
-
-	psk, err := proxy.PSKFromEnv()
-	if err != nil {
-		log.Fatal(err)
+	if *psk == "" {
+		log.Fatal("-psk is required")
 	}
+
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("listening on %s", ln.Addr())
-	log.Fatal(serve(ln, psk, newOutbound(*allowPrivate)))
+	log.Fatal(serve(ln, []byte(*psk), newOutbound(*allowPrivate)))
 }
 
 func serve(ln net.Listener, psk []byte, out *outbound) error {
