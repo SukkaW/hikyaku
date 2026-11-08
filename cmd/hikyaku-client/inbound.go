@@ -43,7 +43,7 @@ func (h *inbound) serveConn(conn net.Conn) {
 }
 
 func (h *inbound) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr, destination M.Socksaddr, _ N.CloseHandlerFunc) {
-	stream, err := h.open(destination)
+	stream, err := newReplayStream(h, destination)
 	if err != nil {
 		N.ReportHandshakeFailure(conn, err)
 		conn.Close()
@@ -60,7 +60,7 @@ func (h *inbound) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksadd
 }
 
 func (h *inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, destination M.Socksaddr, _ N.CloseHandlerFunc) {
-	stream, err := h.open(uot.RequestDestination(uot.Version))
+	_, stream, err := h.open(uot.RequestDestination(uot.Version))
 	if err != nil {
 		conn.Close()
 		return
@@ -70,16 +70,16 @@ func (h *inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 
 // open writes the destination as soon as the stream exists, so protocols where
 // the server speaks first still reach it.
-func (h *inbound) open(destination M.Socksaddr) (*smux.Stream, error) {
-	stream, err := h.pool.openStream()
+func (h *inbound) open(destination M.Socksaddr) (*carrier, *smux.Stream, error) {
+	c, stream, err := h.pool.openStream()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := M.SocksaddrSerializer.WriteAddrPort(stream, destination); err != nil {
 		stream.Close()
-		return nil, err
+		return nil, nil, err
 	}
-	return stream, nil
+	return c, stream, nil
 }
 
 type bufferedConn struct {

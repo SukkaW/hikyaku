@@ -29,6 +29,9 @@ type carrier struct {
 	session *smux.Session
 	conn    *proxy.Conn
 	ready   time.Time
+
+	mu         sync.Mutex
+	unanswered map[*replayStream]struct{}
 }
 
 // pool opens carriers on demand, up to a fixed number of slots; an opened slot is
@@ -73,6 +76,7 @@ func (p *pool) maintain(slot int) {
 		switch {
 		case silent && c.conn.Acked():
 			p.toStandby(c)
+			c.moveUnanswered()
 			log.Printf("carrier %d: silent for %s after %s, standing by", slot, suspectAfter, c.lifetime())
 			go p.retire(c)
 		case silent:
@@ -188,14 +192,15 @@ func (p *pool) retire(c *carrier) {
 
 // openStream waits for a usable carrier when none is ready yet, such as right
 // after start or an outage, so the stream rides the new carrier's first flight.
-func (p *pool) openStream() (*smux.Stream, error) {
+func (p *pool) openStream() (*carrier, *smux.Stream, error) {
 	deadline := time.Now().Add(carrierWait)
 	for {
 		if c := p.pick(); c != nil {
-			return c.session.OpenStream()
+			s, err := c.session.OpenStream()
+			return c, s, err
 		}
 		if time.Now().After(deadline) {
-			return nil, errNoCarrier
+			return nil, nil, errNoCarrier
 		}
 		time.Sleep(carrierPoll)
 	}
