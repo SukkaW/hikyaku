@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 func tcpPair(t *testing.T) (client, server net.Conn) {
@@ -129,4 +130,55 @@ func TestReplayedHelloRejected(t *testing.T) {
 	if r := <-result; !errors.Is(r.err, ErrReplay) {
 		t.Fatalf("replayed hello: got %v, want ErrReplay", r.err)
 	}
+}
+
+func TestZeroRTT(t *testing.T) {
+	t.Run("data before the acknowledgement arrives", func(t *testing.T) {
+		psk := newPSK()
+		clientRaw, serverRaw := tcpPair(t)
+		client, err := ClientHandshake(clientRaw, psk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Write([]byte("early")); err != nil {
+			t.Fatal(err)
+		}
+		if client.Acked() {
+			t.Fatal("acknowledged before the server answered")
+		}
+		server, err := ServerHandshake(serverRaw, psk, NewReplayFilter())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 5)
+		if _, err := io.ReadFull(server, got); err != nil || string(got) != "early" {
+			t.Fatalf("server read %q, %v", got, err)
+		}
+		go server.Write([]byte("!"))
+		if _, err := io.ReadFull(client, got[:1]); err != nil {
+			t.Fatal(err)
+		}
+		if !client.Acked() {
+			t.Fatal("not acknowledged after the server's first chunk")
+		}
+	})
+
+	t.Run("wrong PSK fails the first client read", func(t *testing.T) {
+		clientRaw, serverRaw := tcpPair(t)
+		client, err := ClientHandshake(clientRaw, newPSK())
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			ServerHandshake(serverRaw, newPSK(), NewReplayFilter())
+			serverRaw.Close()
+		}()
+		client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := client.Read(make([]byte, 1)); err == nil {
+			t.Fatal("client read succeeded with a different PSK")
+		}
+		if client.Acked() {
+			t.Fatal("acknowledged with a different PSK")
+		}
+	})
 }

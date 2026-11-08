@@ -85,41 +85,31 @@ type Conn struct {
 	sealNonce [12]byte
 	wbuf      []byte
 
+	psk        []byte
+	clientSalt []byte
+	acked      atomic.Bool
+
 	lastRead atomic.Int64 // unix nanoseconds of the last authenticated chunk
 	readErr  atomic.Pointer[error]
 }
 
-// ClientHandshake sends the client salt and hello, then waits for the server's
-// acknowledgement so that a returned Conn is known to share the PSK.
+// ClientHandshake sends the client salt and hello and returns at once, so streams
+// can follow in the same flight. The server's acknowledgement is checked on the
+// first Read; until then the PSK is unconfirmed.
 func ClientHandshake(conn net.Conn, psk []byte) (*Conn, error) {
 	c := newConn(conn)
-	clientSalt := make([]byte, saltSize)
-	rand.Read(clientSalt)
+	c.psk = psk
+	c.clientSalt = make([]byte, saltSize)
+	rand.Read(c.clientSalt)
 	var err error
-	if c.seal, err = newAEAD(psk, clientSalt, "hikyaku c2s"); err != nil {
+	if c.seal, err = newAEAD(psk, c.clientSalt, "hikyaku c2s"); err != nil {
 		return nil, err
 	}
 	hello := make([]byte, 9)
 	hello[0] = helloVersion
 	binary.BigEndian.PutUint64(hello[1:], uint64(time.Now().Unix()))
-	if err := c.writeWithPrefix(clientSalt, hello); err != nil {
+	if err := c.writeWithPrefix(c.clientSalt, hello); err != nil {
 		return nil, err
-	}
-
-	serverSalt := make([]byte, saltSize)
-	if _, err := io.ReadFull(c.r, serverSalt); err != nil {
-		return nil, err
-	}
-	// Binding the client salt keeps a recorded server response from being replayed to a new carrier.
-	if c.open, err = newAEAD(psk, append(serverSalt, clientSalt...), "hikyaku s2c"); err != nil {
-		return nil, err
-	}
-	ack, err := c.readChunk()
-	if err != nil {
-		return nil, fmt.Errorf("read server acknowledgement: %w", err)
-	}
-	if len(ack) != 1 || ack[0] != helloVersion {
-		return nil, errors.New("unexpected server acknowledgement")
 	}
 	return c, nil
 }
@@ -159,7 +149,10 @@ func ServerHandshake(conn net.Conn, psk []byte, replay *ReplayFilter) (*Conn, er
 }
 
 func newConn(conn net.Conn) *Conn {
-	return &Conn{Conn: conn, r: bufio.NewReaderSize(conn, 64<<10)}
+	c := &Conn{Conn: conn, r: bufio.NewReaderSize(conn, 64<<10)}
+	// Counting from creation makes a carrier that never hears back look silent.
+	c.lastRead.Store(time.Now().UnixNano())
+	return c
 }
 
 func newAEAD(psk, salt []byte, info string) (cipher.AEAD, error) {
@@ -179,6 +172,11 @@ func (c *Conn) LastRead() time.Time {
 	return time.Unix(0, c.lastRead.Load())
 }
 
+// Acked reports whether the server has acknowledged a client handshake.
+func (c *Conn) Acked() bool {
+	return c.acked.Load()
+}
+
 // ReadErr returns the first error the carrier hit while reading, if any.
 func (c *Conn) ReadErr() error {
 	if err := c.readErr.Load(); err != nil {
@@ -188,8 +186,16 @@ func (c *Conn) ReadErr() error {
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
+	// Errors are sticky, so a failed acknowledgement can never be skipped by reading again.
+	if err := c.ReadErr(); err != nil {
+		return 0, err
+	}
 	if len(c.pending) == 0 {
-		p, err := c.readChunk()
+		err := c.awaitAck()
+		var p []byte
+		if err == nil {
+			p, err = c.readChunk()
+		}
 		if err != nil {
 			c.readErr.CompareAndSwap(nil, &err)
 			return 0, err
@@ -199,6 +205,33 @@ func (c *Conn) Read(b []byte) (int, error) {
 	n := copy(b, c.pending)
 	c.pending = c.pending[n:]
 	return n, nil
+}
+
+// awaitAck finishes a client handshake on the first Read: the server salt and
+// acknowledgement arrive after whatever the client already sent behind its hello.
+func (c *Conn) awaitAck() error {
+	if c.open != nil {
+		return nil
+	}
+	serverSalt := make([]byte, saltSize)
+	if _, err := io.ReadFull(c.r, serverSalt); err != nil {
+		return err
+	}
+	// Binding the client salt keeps a recorded server response from being replayed to a new carrier.
+	open, err := newAEAD(c.psk, append(serverSalt, c.clientSalt...), "hikyaku s2c")
+	if err != nil {
+		return err
+	}
+	c.open = open
+	ack, err := c.readChunk()
+	if err != nil {
+		return fmt.Errorf("read server acknowledgement: %w", err)
+	}
+	if len(ack) != 1 || ack[0] != helloVersion {
+		return errors.New("unexpected server acknowledgement")
+	}
+	c.acked.Store(true)
+	return nil
 }
 
 func (c *Conn) Write(b []byte) (int, error) {

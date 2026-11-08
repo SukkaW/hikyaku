@@ -18,6 +18,8 @@ const (
 	maxBackoff   = 5 * time.Second
 	suspectAfter = 5 * time.Second
 	healthCheck  = 500 * time.Millisecond
+	carrierWait  = 10 * time.Second
+	carrierPoll  = 50 * time.Millisecond
 )
 
 var errNoCarrier = errors.New("no carrier is ready")
@@ -89,7 +91,8 @@ func (p *pool) toStandby(c *carrier) {
 func (p *pool) replaced(slot int) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.carriers[slot] != nil
+	c := p.carriers[slot]
+	return c != nil && c.conn.Acked()
 }
 
 func (p *pool) dial() (*carrier, error) {
@@ -97,13 +100,11 @@ func (p *pool) dial() (*carrier, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn.SetDeadline(time.Now().Add(dialTimeout))
 	c, err := proxy.ClientHandshake(conn, p.psk)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	conn.SetDeadline(time.Time{})
 	session, err := smux.Client(c, proxy.MuxConfig())
 	if err != nil {
 		conn.Close()
@@ -172,19 +173,34 @@ func (p *pool) retire(c *carrier) {
 	}
 }
 
+// openStream waits for a usable carrier when none is ready yet, such as right
+// after start or an outage, so the stream rides the new carrier's first flight.
 func (p *pool) openStream() (*smux.Stream, error) {
+	deadline := time.Now().Add(carrierWait)
+	for {
+		if c := p.pick(); c != nil {
+			return c.session.OpenStream()
+		}
+		if time.Now().After(deadline) {
+			return nil, errNoCarrier
+		}
+		time.Sleep(carrierPoll)
+	}
+}
+
+func (p *pool) pick() *carrier {
 	p.mu.Lock()
-	best := fewestStreams(p.carriers, nil)
+	defer p.mu.Unlock()
+	best := fewestStreams(p.carriers, func(c *carrier) bool { return c.conn.Acked() })
+	if best == nil {
+		best = fewestStreams(p.carriers, nil)
+	}
 	if best == nil {
 		// A standby carrier takes new streams only once it is receiving again, and
 		// only while no active carrier is usable.
 		best = fewestStreams(p.standby, func(c *carrier) bool { return !c.silent() })
 	}
-	p.mu.Unlock()
-	if best == nil {
-		return nil, errNoCarrier
-	}
-	return best.session.OpenStream()
+	return best
 }
 
 func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
