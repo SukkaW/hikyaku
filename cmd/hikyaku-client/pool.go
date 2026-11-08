@@ -24,6 +24,7 @@ var errNoCarrier = errors.New("no carrier is ready")
 type carrier struct {
 	session *smux.Session
 	conn    *proxy.Conn
+	ready   time.Time
 }
 
 // pool keeps a fixed set of pre-opened carriers; a slot is nil while its carrier is down.
@@ -58,10 +59,10 @@ func (p *pool) maintain(slot int) {
 		silent := c.watch()
 		p.set(slot, nil)
 		if silent {
-			log.Printf("carrier %d: silent, replacing", slot)
-			go c.drain()
+			log.Printf("carrier %d: silent for %s after %s, replacing", slot, suspectAfter, c.lifetime())
+			go c.drain(slot)
 		} else {
-			log.Printf("carrier %d: closed", slot)
+			log.Printf("carrier %d: closed after %s: %s", slot, c.lifetime(), c.closeReason())
 		}
 	}
 }
@@ -89,7 +90,20 @@ func (p *pool) dial() (*carrier, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &carrier{session: session, conn: c}, nil
+	return &carrier{session: session, conn: c, ready: time.Now()}, nil
+}
+
+func (c *carrier) lifetime() time.Duration {
+	return time.Since(c.ready).Round(time.Second)
+}
+
+// closeReason explains why the session ended. smux closes the connection itself
+// on keepalive timeout, which reaches the reader as net.ErrClosed.
+func (c *carrier) closeReason() string {
+	if err := c.conn.ReadErr(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err.Error()
+	}
+	return "keepalive timeout"
 }
 
 // watch reports true once the carrier has received nothing for suspectAfter,
@@ -111,16 +125,18 @@ func (c *carrier) watch() bool {
 
 // drain lets a silent carrier finish its existing streams, which survive a short
 // outage; if the server never returns, smux's keepalive timeout closes it instead.
-func (c *carrier) drain() {
+func (c *carrier) drain(slot int) {
 	tick := time.NewTicker(healthCheck)
 	defer tick.Stop()
 	for {
 		select {
 		case <-c.session.CloseChan():
+			log.Printf("carrier %d: replaced carrier closed after %s: %s", slot, c.lifetime(), c.closeReason())
 			return
 		case <-tick.C:
 			if c.session.NumStreams() == 0 {
 				c.session.Close()
+				log.Printf("carrier %d: replaced carrier drained after %s", slot, c.lifetime())
 				return
 			}
 		}

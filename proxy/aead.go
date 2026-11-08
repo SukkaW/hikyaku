@@ -86,6 +86,7 @@ type Conn struct {
 	wbuf      []byte
 
 	lastRead atomic.Int64 // unix nanoseconds of the last authenticated chunk
+	readErr  atomic.Pointer[error]
 }
 
 // ClientHandshake sends the client salt and hello, then waits for the server's
@@ -178,10 +179,19 @@ func (c *Conn) LastRead() time.Time {
 	return time.Unix(0, c.lastRead.Load())
 }
 
+// ReadErr returns the first error the carrier hit while reading, if any.
+func (c *Conn) ReadErr() error {
+	if err := c.readErr.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
 func (c *Conn) Read(b []byte) (int, error) {
 	if len(c.pending) == 0 {
 		p, err := c.readChunk()
 		if err != nil {
+			c.readErr.CompareAndSwap(nil, &err)
 			return 0, err
 		}
 		c.pending = p
