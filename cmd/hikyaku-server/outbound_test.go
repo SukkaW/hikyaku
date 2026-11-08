@@ -69,6 +69,7 @@ func TestTCPTarget(t *testing.T) {
 	t.Run("refused", func(t *testing.T) {
 		stream := openStream(t, false, destination)
 		stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+		readPong(t, stream)
 		if _, err := stream.Read(make([]byte, 1)); err != io.EOF {
 			t.Fatalf("stream read: got %v, want EOF from a refused dial", err)
 		}
@@ -92,10 +93,19 @@ func TestTCPTarget(t *testing.T) {
 			t.Fatalf("target read %q, %v", got, err)
 		}
 		conn.Write([]byte("pong"))
+		readPong(t, stream)
 		if _, err := io.ReadFull(stream, got); err != nil || string(got) != "pong" {
 			t.Fatalf("stream read %q, %v", got, err)
 		}
 	})
+}
+
+func readPong(t *testing.T, stream io.Reader) {
+	t.Helper()
+	var p [1]byte
+	if _, err := io.ReadFull(stream, p[:]); err != nil || p[0] != proxy.Pong {
+		t.Fatalf("read %v, %v; want the server's pong first", p, err)
+	}
 }
 
 func TestUDPTarget(t *testing.T) {
@@ -118,6 +128,7 @@ func TestUDPTarget(t *testing.T) {
 
 	roundTrip := func(t *testing.T, allowPrivate bool) error {
 		stream := openStream(t, allowPrivate, uot.RequestDestination(uot.Version))
+		readPong(t, stream)
 		conn := uot.NewLazyConn(stream, uot.Request{Destination: destination})
 		if _, err := conn.WriteTo([]byte("ping"), echo.LocalAddr()); err != nil {
 			t.Fatal(err)

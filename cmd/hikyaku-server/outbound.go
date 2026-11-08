@@ -62,6 +62,9 @@ func (o *outbound) handle(stream *smux.Stream) {
 		return
 	}
 	stream.SetReadDeadline(time.Time{})
+	if _, err := stream.Write([]byte{proxy.Pong}); err != nil {
+		return
+	}
 
 	if destination.Fqdn == uot.MagicAddress {
 		o.relayUDP(stream)

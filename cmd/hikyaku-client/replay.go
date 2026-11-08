@@ -7,7 +7,6 @@ import (
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/xtaci/smux"
 )
 
 const (
@@ -24,7 +23,7 @@ type replayStream struct {
 	h           *inbound
 	destination M.Socksaddr
 
-	stream     atomic.Pointer[smux.Stream]
+	stream     atomic.Pointer[carrierStream]
 	carrier    atomic.Pointer[carrier]
 	replayable atomic.Bool
 	answered   atomic.Bool
@@ -112,7 +111,7 @@ func (r *replayStream) Read(b []byte) (int, error) {
 // replayLocked moves to another carrier if s failed before any response arrived
 // because its carrier closed or went silent, and reports whether to carry on with
 // the new stream. The caller holds r.mu.
-func (r *replayStream) replayLocked(s *smux.Stream) bool {
+func (r *replayStream) replayLocked(s *carrierStream) bool {
 	if s != r.stream.Load() {
 		return true
 	}

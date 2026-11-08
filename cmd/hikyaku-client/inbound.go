@@ -12,7 +12,6 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
 	"github.com/sagernet/sing/protocol/socks"
-	"github.com/xtaci/smux"
 )
 
 const udpTimeout = 5 * time.Minute
@@ -70,7 +69,7 @@ func (h *inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 
 // open writes the destination as soon as the stream exists, so protocols where
 // the server speaks first still reach it.
-func (h *inbound) open(destination M.Socksaddr) (*carrier, *smux.Stream, error) {
+func (h *inbound) open(destination M.Socksaddr) (*carrier, *carrierStream, error) {
 	c, stream, err := h.pool.openStream()
 	if err != nil {
 		return nil, nil, err

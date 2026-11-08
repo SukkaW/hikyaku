@@ -2,10 +2,12 @@ package main
 
 import (
 	"errors"
+	"io"
 	"log"
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
@@ -22,16 +24,21 @@ const (
 	carrierPoll  = 50 * time.Millisecond
 )
 
-var errNoCarrier = errors.New("no carrier is ready")
+var (
+	errNoCarrier = errors.New("no carrier is ready")
+	errBadPong   = errors.New("stream did not start with a pong")
+)
 
 type carrier struct {
 	slot    int
 	session *smux.Session
 	conn    *proxy.Conn
 	ready   time.Time
+	rtt     atomic.Int64 // smoothed pong round trip in nanoseconds; 0 until the first pong
 
 	mu         sync.Mutex
 	unanswered map[*replayStream]struct{}
+	waiting    map[*carrierStream]time.Time // streams still waiting for their pong
 }
 
 // pool opens carriers on demand, up to a fixed number of slots; an opened slot is
@@ -192,12 +199,15 @@ func (p *pool) retire(c *carrier) {
 
 // openStream waits for a usable carrier when none is ready yet, such as right
 // after start or an outage, so the stream rides the new carrier's first flight.
-func (p *pool) openStream() (*carrier, *smux.Stream, error) {
+func (p *pool) openStream() (*carrier, *carrierStream, error) {
 	deadline := time.Now().Add(carrierWait)
 	for {
 		if c := p.pick(); c != nil {
 			s, err := c.session.OpenStream()
-			return c, s, err
+			if err != nil {
+				return nil, nil, err
+			}
+			return c, c.newStream(s), nil
 		}
 		if time.Now().After(deadline) {
 			return nil, nil, errNoCarrier
@@ -240,4 +250,56 @@ func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 		}
 	}
 	return best
+}
+
+// carrierStream strips the server's pong from the front of a stream and turns it
+// into a round-trip sample for its carrier.
+type carrierStream struct {
+	*smux.Stream
+	c      *carrier
+	opened time.Time
+	ponged bool // only touched by the single reader
+}
+
+func (c *carrier) newStream(s *smux.Stream) *carrierStream {
+	cs := &carrierStream{Stream: s, c: c, opened: time.Now()}
+	c.mu.Lock()
+	if c.waiting == nil {
+		c.waiting = make(map[*carrierStream]time.Time)
+	}
+	c.waiting[cs] = cs.opened
+	c.mu.Unlock()
+	return cs
+}
+
+func (s *carrierStream) Read(b []byte) (int, error) {
+	if !s.ponged {
+		var p [1]byte
+		if _, err := io.ReadFull(s.Stream, p[:]); err != nil {
+			return 0, err
+		}
+		if p[0] != proxy.Pong {
+			return 0, errBadPong
+		}
+		s.ponged = true
+		s.c.pong(s, time.Since(s.opened))
+	}
+	return s.Stream.Read(b)
+}
+
+func (s *carrierStream) Close() error {
+	s.c.mu.Lock()
+	delete(s.c.waiting, s)
+	s.c.mu.Unlock()
+	return s.Stream.Close()
+}
+
+func (c *carrier) pong(s *carrierStream, rtt time.Duration) {
+	c.mu.Lock()
+	delete(c.waiting, s)
+	c.mu.Unlock()
+	if old := c.rtt.Load(); old != 0 {
+		rtt = time.Duration(old) + (rtt-time.Duration(old))/4
+	}
+	c.rtt.Store(int64(rtt))
 }
