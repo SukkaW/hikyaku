@@ -31,22 +31,28 @@ type carrier struct {
 	ready   time.Time
 }
 
-// pool keeps a fixed set of pre-opened carriers; a slot is nil while its carrier is
-// down. Silent carriers wait on standby until their slot has a replacement.
+// pool opens carriers on demand, up to a fixed number of slots; an opened slot is
+// nil while its carrier is down and keeps being redialed. Silent carriers wait on
+// standby until their slot has a replacement.
 type pool struct {
 	server   string
 	psk      []byte
 	mu       sync.Mutex
 	carriers []*carrier
 	standby  []*carrier
+	opened   int
 }
 
 func newPool(server string, psk []byte, carriers int) *pool {
-	p := &pool{server: server, psk: psk, carriers: make([]*carrier, carriers)}
-	for slot := range p.carriers {
-		go p.maintain(slot)
+	return &pool{server: server, psk: psk, carriers: make([]*carrier, carriers)}
+}
+
+// grow starts maintaining one more slot; the caller holds p.mu.
+func (p *pool) grow() {
+	if p.opened < len(p.carriers) {
+		go p.maintain(p.opened)
+		p.opened++
 	}
-	return p
 }
 
 func (p *pool) maintain(slot int) {
@@ -198,7 +204,15 @@ func (p *pool) openStream() (*smux.Stream, error) {
 func (p *pool) pick() *carrier {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.opened == 0 {
+		p.grow()
+	}
 	best := fewestStreams(p.carriers, func(c *carrier) bool { return c.conn.Acked() })
+	if best != nil && best.session.NumStreams() > 0 {
+		// No acknowledged carrier is idle: open another in the background for the
+		// next request instead of making this one wait for it.
+		p.grow()
+	}
 	if best == nil {
 		// A standby carrier takes new streams only once it is receiving again; that
 		// proves more than a new carrier still waiting for its acknowledgement.

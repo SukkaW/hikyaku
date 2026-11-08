@@ -10,7 +10,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	server := flag.String("server", "", "server address (host:port)")
 	psk := flag.String("psk", "", "pre-shared key, any string")
-	carriers := flag.Int("carriers", 4, "number of pre-opened carriers")
+	carriers := flag.Int("carriers", 4, "maximum number of carriers")
 	flag.Parse()
 
 	if *server == "" {

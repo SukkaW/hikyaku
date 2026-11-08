@@ -61,19 +61,6 @@ func startServer(t *testing.T, psk string) string {
 func startClient(t *testing.T, server string, psk []byte) *socks.Client {
 	t.Helper()
 	p := newPool(server, psk, 2)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		p.mu.Lock()
-		ready := p.carriers[0] != nil && p.carriers[1] != nil
-		p.mu.Unlock()
-		if ready {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("carriers never became ready")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
