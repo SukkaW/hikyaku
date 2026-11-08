@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,17 +23,20 @@ const (
 var errNoCarrier = errors.New("no carrier is ready")
 
 type carrier struct {
+	slot    int
 	session *smux.Session
 	conn    *proxy.Conn
 	ready   time.Time
 }
 
-// pool keeps a fixed set of pre-opened carriers; a slot is nil while its carrier is down.
+// pool keeps a fixed set of pre-opened carriers; a slot is nil while its carrier is
+// down. Silent carriers wait on standby until their slot has a replacement.
 type pool struct {
 	server   string
 	psk      []byte
 	mu       sync.Mutex
 	carriers []*carrier
+	standby  []*carrier
 }
 
 func newPool(server string, psk []byte, carriers int) *pool {
@@ -54,14 +58,16 @@ func (p *pool) maintain(slot int) {
 			continue
 		}
 		backoff = 0
+		c.slot = slot
 		p.set(slot, c)
 		log.Printf("carrier %d: ready", slot)
 		silent := c.watch()
-		p.set(slot, nil)
 		if silent {
-			log.Printf("carrier %d: silent for %s after %s, replacing", slot, suspectAfter, c.lifetime())
-			go c.drain(slot)
+			p.toStandby(c)
+			log.Printf("carrier %d: silent for %s after %s, standing by", slot, suspectAfter, c.lifetime())
+			go p.retire(c)
 		} else {
+			p.set(slot, nil)
 			log.Printf("carrier %d: closed after %s: %s", slot, c.lifetime(), c.closeReason())
 		}
 	}
@@ -71,6 +77,19 @@ func (p *pool) set(slot int, c *carrier) {
 	p.mu.Lock()
 	p.carriers[slot] = c
 	p.mu.Unlock()
+}
+
+func (p *pool) toStandby(c *carrier) {
+	p.mu.Lock()
+	p.carriers[c.slot] = nil
+	p.standby = append(p.standby, c)
+	p.mu.Unlock()
+}
+
+func (p *pool) replaced(slot int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.carriers[slot] != nil
 }
 
 func (p *pool) dial() (*carrier, error) {
@@ -106,6 +125,10 @@ func (c *carrier) closeReason() string {
 	return "keepalive timeout"
 }
 
+func (c *carrier) silent() bool {
+	return time.Since(c.conn.LastRead()) >= suspectAfter
+}
+
 // watch reports true once the carrier has received nothing for suspectAfter,
 // and false if its session closes first.
 func (c *carrier) watch() bool {
@@ -116,27 +139,33 @@ func (c *carrier) watch() bool {
 		case <-c.session.CloseChan():
 			return false
 		case <-tick.C:
-			if time.Since(c.conn.LastRead()) >= suspectAfter {
+			if c.silent() {
 				return true
 			}
 		}
 	}
 }
 
-// drain lets a silent carrier finish its existing streams, which survive a short
-// outage; if the server never returns, smux's keepalive timeout closes it instead.
-func (c *carrier) drain(slot int) {
+// retire keeps a standby carrier for its existing streams, which survive a short
+// outage, and closes it once its slot is replaced and those streams are done; if
+// the server never returns, smux's keepalive timeout closes it instead.
+func (p *pool) retire(c *carrier) {
 	tick := time.NewTicker(healthCheck)
 	defer tick.Stop()
+	defer func() {
+		p.mu.Lock()
+		p.standby = slices.DeleteFunc(p.standby, func(s *carrier) bool { return s == c })
+		p.mu.Unlock()
+	}()
 	for {
 		select {
 		case <-c.session.CloseChan():
-			log.Printf("carrier %d: replaced carrier closed after %s: %s", slot, c.lifetime(), c.closeReason())
+			log.Printf("carrier %d: standby closed after %s: %s", c.slot, c.lifetime(), c.closeReason())
 			return
 		case <-tick.C:
-			if c.session.NumStreams() == 0 {
+			if c.session.NumStreams() == 0 && p.replaced(c.slot) {
 				c.session.Close()
-				log.Printf("carrier %d: replaced carrier drained after %s", slot, c.lifetime())
+				log.Printf("carrier %d: standby retired after %s", c.slot, c.lifetime())
 				return
 			}
 		}
@@ -145,15 +174,28 @@ func (c *carrier) drain(slot int) {
 
 func (p *pool) openStream() (*smux.Stream, error) {
 	p.mu.Lock()
-	var best *carrier
-	for _, c := range p.carriers {
-		if c != nil && !c.session.IsClosed() && (best == nil || c.session.NumStreams() < best.session.NumStreams()) {
-			best = c
-		}
+	best := fewestStreams(p.carriers, nil)
+	if best == nil {
+		// A standby carrier takes new streams only once it is receiving again, and
+		// only while no active carrier is usable.
+		best = fewestStreams(p.standby, func(c *carrier) bool { return !c.silent() })
 	}
 	p.mu.Unlock()
 	if best == nil {
 		return nil, errNoCarrier
 	}
 	return best.session.OpenStream()
+}
+
+func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
+	var best *carrier
+	for _, c := range carriers {
+		if c == nil || c.session.IsClosed() || (eligible != nil && !eligible(c)) {
+			continue
+		}
+		if best == nil || c.session.NumStreams() < best.session.NumStreams() {
+			best = c
+		}
+	}
+	return best
 }
