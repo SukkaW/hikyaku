@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
 	"testing"
@@ -160,7 +161,7 @@ func TestChoose(t *testing.T) {
 
 func TestExpectedWait(t *testing.T) {
 	now := time.Now()
-	c := &carrier{pings: make(map[uint32]time.Time), waiting: make(map[*carrierStream]time.Time)}
+	c := &carrier{pings: make(map[uint32]ping), waiting: make(map[*carrierStream]time.Time)}
 	if got := c.expectedWait(now); got >= 0 {
 		t.Fatalf("no samples and nothing outstanding: %s, want unknown", got)
 	}
@@ -168,7 +169,7 @@ func TestExpectedWait(t *testing.T) {
 	if got := c.expectedWait(now); got != 600*time.Millisecond {
 		t.Fatalf("latest round trip only: %s, want 600ms", got)
 	}
-	c.pings[1] = now.Add(-2 * time.Second)
+	c.pings[1] = ping{sent: now.Add(-2 * time.Second)}
 	if got := c.expectedWait(now); got != 2*time.Second {
 		t.Fatalf("with a ping unanswered for 2s: %s, want 2s", got)
 	}
@@ -176,6 +177,48 @@ func TestExpectedWait(t *testing.T) {
 	c.waiting[&carrierStream{}] = now.Add(-time.Second)
 	if got := c.expectedWait(now); got != time.Second {
 		t.Fatalf("with an acknowledgement 1s overdue: %s, want 1s", got)
+	}
+}
+
+func TestQuietSamples(t *testing.T) {
+	c := &carrier{pings: make(map[uint32]ping)}
+	pong := func(id uint32) { c.control(proxy.CtrlPong, binary.BigEndian.AppendUint32(nil, id)) }
+	c.pings[1] = ping{sent: time.Now(), quiet: true}
+	c.pings[2] = ping{sent: time.Now(), quiet: false}
+	pong(1)
+	pong(2)
+	if len(c.quiet) != 1 {
+		t.Fatalf("%d quiet samples, want only the quiet ping's", len(c.quiet))
+	}
+
+	now := time.Now()
+	ms := time.Millisecond
+	c.quiet = []sample{{now.Add(-quietWindow - time.Second), 100 * ms}, {now, 900 * ms}, {now, 600 * ms}}
+	if _, ok := c.quietMedian(now); ok {
+		t.Fatal("judged from 2 recent samples; one is older than the window")
+	}
+	c.quiet = append(c.quiet, sample{now, 700 * ms})
+	if got, ok := c.quietMedian(now); !ok || got != 700*ms {
+		t.Fatalf("median %s, %v; want 700ms from the 3 recent samples", got, ok)
+	}
+}
+
+func TestSlowerThan(t *testing.T) {
+	ms := time.Millisecond
+	cases := []struct {
+		name       string
+		mine, best time.Duration
+		want       bool
+	}{
+		{"GEO, under half the best", 900 * ms, 620 * ms, false},
+		{"GEO, over half the best", 1000 * ms, 620 * ms, true},
+		{"Starlink, under the 200 ms floor", 220 * ms, 30 * ms, false},
+		{"Starlink, over the 200 ms floor", 240 * ms, 30 * ms, true},
+	}
+	for _, c := range cases {
+		if got := slowerThan(c.mine, c.best); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 

@@ -93,6 +93,7 @@ type Conn struct {
 	control  func(cmd byte, body []byte)
 	lastRead atomic.Int64 // unix nanoseconds of the last authenticated chunk
 	lastData atomic.Int64 // unix nanoseconds of the last chunk carrying smux data
+	lastSent atomic.Int64 // unix nanoseconds of the last smux data written
 	readErr  atomic.Pointer[error]
 }
 
@@ -180,6 +181,11 @@ func (c *Conn) LastData() time.Time {
 	return time.Unix(0, c.lastData.Load())
 }
 
+// LastSent reports when smux data was last written; control messages do not count.
+func (c *Conn) LastSent() time.Time {
+	return time.Unix(0, c.lastSent.Load())
+}
+
 // Acked reports whether the server has acknowledged a client handshake.
 func (c *Conn) Acked() bool {
 	return c.acked.Load()
@@ -262,6 +268,7 @@ func (c *Conn) awaitAck() error {
 func (c *Conn) Write(b []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	c.lastSent.Store(time.Now().UnixNano())
 	if err := c.writeWithPrefix(nil, b, 0); err != nil {
 		return 0, err
 	}

@@ -24,11 +24,19 @@ const (
 	carrierPoll  = 50 * time.Millisecond
 	ackTimeout   = 3 * time.Second
 	pongTimeout  = 3 * time.Second
-	slowMargin   = time.Second
 	slowStrikes  = 3
 	slowEvery    = 2 * time.Second
 	metricsEvery = 30 * time.Second
 	probeWait    = 5 * time.Second
+	// Slowness is judged only from pongs to pings sent while a carrier carried no
+	// data, so a busy carrier's own queue cannot make it look slow: the median of its
+	// last quietSamples such round trips within quietWindow, needing minQuietSamples,
+	// against the best other carrier's, with a margin of half the best or
+	// minSlowMargin, whichever is larger.
+	quietSamples    = 5
+	minQuietSamples = 3
+	quietWindow     = 10 * time.Second
+	minSlowMargin   = 200 * time.Millisecond
 	// Pings go out only when a carrier is quiet: often while it was in use recently,
 	// which keeps the server's congestion window from shrinking during reading
 	// pauses, and rarely once idle. A busy carrier still gets one every second, so its
@@ -57,13 +65,24 @@ type carrier struct {
 
 	lastStream atomic.Int64           // unix nanoseconds when a stream last closed
 	goaway     atomic.Pointer[string] // the server's reason, once it sent GOAWAY
-	pingNow    chan struct{}
+	pingNow    chan bool              // asks for a ping; true if the carrier is quiet
 
 	mu         sync.Mutex
 	unanswered map[*replayStream]struct{}
 	waiting    map[*carrierStream]time.Time // streams still waiting for their acknowledgement
-	pings      map[uint32]time.Time         // pings still waiting for their pong
+	pings      map[uint32]ping              // pings still waiting for their pong
 	nextPing   uint32
+	quiet      []sample // round trips of pings sent while quiet, oldest first
+}
+
+type ping struct {
+	sent  time.Time
+	quiet bool // the carrier carried no data when it was sent
+}
+
+type sample struct {
+	at  time.Time
+	rtt time.Duration
 }
 
 // pool opens carriers on demand, up to a fixed number of slots; an opened slot is
@@ -128,8 +147,8 @@ func (p *pool) maintain(slot int) {
 		case v == slow:
 			p.toStandby(c)
 			c.moveUnanswered()
-			log.Printf("carrier %d: %s slower than the best other carrier for %d checks after %s, standing by",
-				slot, slowMargin, slowStrikes, c.lifetime())
+			log.Printf("carrier %d: slower than the best other carrier while quiet for %d checks after %s, standing by",
+				slot, slowStrikes, c.lifetime())
 			go p.retire(c)
 		case silent && c.conn.Acked():
 			p.toStandby(c)
@@ -192,7 +211,7 @@ func (p *pool) dial() (*carrier, error) {
 		conn.Close()
 		return nil, err
 	}
-	c := &carrier{conn: pc, pings: make(map[uint32]time.Time), pingNow: make(chan struct{}, 1)}
+	c := &carrier{conn: pc, pings: make(map[uint32]ping), pingNow: make(chan bool, 1)}
 	pc.OnControl(c.control)
 	session, err := smux.Client(pc, proxy.MuxConfig())
 	if err != nil {
@@ -226,11 +245,17 @@ func (c *carrier) control(cmd byte, body []byte) {
 		}
 		id := binary.BigEndian.Uint32(body)
 		c.mu.Lock()
-		sent, ok := c.pings[id]
+		pg, ok := c.pings[id]
 		delete(c.pings, id)
+		if ok && pg.quiet {
+			c.quiet = append(c.quiet, sample{time.Now(), time.Since(pg.sent)})
+			if len(c.quiet) > quietSamples {
+				c.quiet = c.quiet[1:]
+			}
+		}
 		c.mu.Unlock()
 		if ok {
-			c.sample(time.Since(sent))
+			c.sample(time.Since(pg.sent))
 		}
 	case proxy.CtrlGoAway:
 		reason := "server going away"
@@ -247,11 +272,11 @@ func (c *carrier) control(cmd byte, body []byte) {
 func (c *carrier) sendPings() {
 	for {
 		select {
-		case <-c.pingNow:
+		case quiet := <-c.pingNow:
 			c.mu.Lock()
 			id := c.nextPing
 			c.nextPing++
-			c.pings[id] = time.Now()
+			c.pings[id] = ping{sent: time.Now(), quiet: quiet}
 			c.mu.Unlock()
 			var body [4]byte
 			binary.BigEndian.PutUint32(body[:], id)
@@ -264,11 +289,29 @@ func (c *carrier) sendPings() {
 	}
 }
 
-func (c *carrier) ping() {
+func (c *carrier) ping(now time.Time) {
+	quiet := now.Sub(c.conn.LastData()) >= quietAfter && now.Sub(c.conn.LastSent()) >= quietAfter
 	select {
-	case c.pingNow <- struct{}{}:
+	case c.pingNow <- quiet:
 	default:
 	}
+}
+
+// quietMedian returns the median of c's recent quiet round trips, if it has enough.
+func (c *carrier) quietMedian(now time.Time) (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var recent []time.Duration
+	for _, s := range c.quiet {
+		if now.Sub(s.at) <= quietWindow {
+			recent = append(recent, s.rtt)
+		}
+	}
+	if len(recent) < minQuietSamples {
+		return 0, false
+	}
+	slices.Sort(recent)
+	return recent[len(recent)/2], true
 }
 
 // pingInterval picks how often to ping a carrier from how long ago its last smux
@@ -288,8 +331,8 @@ func pingInterval(sinceData, sinceStream time.Duration, streams int) time.Durati
 func (c *carrier) pongOverdue(d time.Duration) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, sent := range c.pings {
-		if time.Since(sent) >= d {
+	for _, pg := range c.pings {
+		if time.Since(pg.sent) >= d {
 			return true
 		}
 	}
@@ -348,7 +391,7 @@ func (p *pool) watch(c *carrier) verdict {
 			interval := pingInterval(now.Sub(c.conn.LastData()), sinceStream, c.session.NumStreams())
 			if now.Sub(lastPing) >= interval-healthCheck/2 {
 				lastPing = now
-				c.ping()
+				c.ping(now)
 			}
 			quiet := p.linkQuiet()
 			if quiet {
@@ -390,25 +433,31 @@ func (p *pool) watch(c *carrier) verdict {
 	}
 }
 
-// slower reports whether c's round trip exceeds the best other acknowledged
-// carrier's by slowMargin; with no other carrier, or no samples yet, nothing is slow.
+// slower reports whether c's quiet round trips sit clearly above the best other
+// acknowledged carrier's; a carrier without enough of them, such as a busy one, is
+// not judged, and with no other carrier to compare against nothing is slow.
 func (p *pool) slower(c *carrier) bool {
-	rtt := time.Duration(c.rtt.Load())
-	if !c.conn.Acked() || rtt == 0 {
+	now := time.Now()
+	mine, ok := c.quietMedian(now)
+	if !c.conn.Acked() || !ok {
 		return false
 	}
 	p.mu.Lock()
-	var best time.Duration
+	best := time.Duration(-1)
 	for _, o := range p.carriers {
 		if o == nil || o == c || !o.conn.Acked() || o.session.IsClosed() {
 			continue
 		}
-		if r := time.Duration(o.rtt.Load()); r != 0 && (best == 0 || r < best) {
-			best = r
+		if m, ok := o.quietMedian(now); ok && (best < 0 || m < best) {
+			best = m
 		}
 	}
 	p.mu.Unlock()
-	return best != 0 && rtt-best >= slowMargin
+	return best >= 0 && slowerThan(mine, best)
+}
+
+func slowerThan(mine, best time.Duration) bool {
+	return mine-best >= max(best/2, minSlowMargin)
 }
 
 // linkQuiet reports a link-wide outage: some carriers have been acknowledged, yet
@@ -498,7 +547,7 @@ func (p *pool) retire(c *carrier) {
 				log.Printf("carrier %d: standby closed after %s: no pong for %s", c.slot, c.lifetime(), deadAfter)
 				return
 			}
-			c.ping()
+			c.ping(time.Now())
 		}
 	}
 }
@@ -639,8 +688,8 @@ func (c *carrier) expectedWait(now time.Time) time.Duration {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, sent := range c.pings {
-		wait = max(wait, now.Sub(sent))
+	for _, pg := range c.pings {
+		wait = max(wait, now.Sub(pg.sent))
 	}
 	for _, opened := range c.waiting {
 		wait = max(wait, now.Sub(opened))
