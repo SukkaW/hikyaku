@@ -4,10 +4,14 @@
 Run as root on Linux (see tools/netsim/Dockerfile). Every system gets its own netsim
 instance per profile, with its server and the test website in that instance's server
 namespace and its client in the client namespace. It measures through each system's
-SOCKS5 port: cold start, 20 warm small HTTPS fetches, a 6-way burst, downloads sized
-to about 8 s at the profile's download cap (1-10 MB), and small fetches during a
-download. On profiles capped at 100 Mbit/s or less the systems run in parallel, since
-their paths are separate and the CPU is not the bottleneck there.
+SOCKS5 port: cold start, a 6-way burst of small HTTPS fetches like a page load,
+downloads sized to about 8 s at the profile's download cap (1-10 MB), and small
+fetches during a download. --quick, for prototyping, replaces the downloads and the
+loaded test with one short download that has two small fetches made during it.
+
+Runs on paths capped at 100 Mbit/s or less all run at once, since they spend their
+time waiting on delay; faster paths keep the CPU busy, so they run one at a time in a
+lane of their own alongside.
 """
 import argparse
 import concurrent.futures
@@ -59,6 +63,7 @@ SMALL = "https://localhost:9443/"
 BIG = "http://localhost:9001/big?n={}"
 BULK_SECONDS = 8
 BULK_LIMIT_S = 20
+QUICK_BULK_LIMIT_S = 6
 PARALLEL_MAX_MBPS = 100
 ENV = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -206,24 +211,33 @@ def measure(run, start_client, socks, size):
             return list(ex.map(lambda _: curl(run, socks, SMALL, 30), range(6)))
 
     burst()  # let pools that grow on demand reach their working size
-    time.sleep(1)
-
-    warm = [curl(run, socks, SMALL, 30) for _ in range(20)]
-    times = sorted(s for ok, s, _ in warm if ok)
-    result["warm_median_s"] = round(statistics.median(times), 3) if times else None
-    result["warm_p90_s"] = round(times[max(0, int(len(times) * 0.9) - 1)], 3) if times else None
-    result["warm_failures"] = sum(1 for ok, _, _ in warm if not ok)
+    time.sleep(0.3 if opts.quick else 1)
 
     b = burst()
     result["burst_max_s"] = round(max(s for ok, s, _ in b if ok), 3) if all(ok for ok, _, _ in b) else None
     result["burst_failures"] = sum(1 for ok, _, _ in b if not ok)
+    result["bulk_mb"] = round(size / 1e6, 1)
+
+    if opts.quick:
+        # One download, with two small fetches made during it, stands in for both the
+        # timed downloads and the loaded test.
+        with concurrent.futures.ThreadPoolExecutor(1) as ex:
+            download = ex.submit(curl, run, socks, BIG.format(size), QUICK_BULK_LIMIT_S)
+            time.sleep(1)
+            loaded = [curl(run, socks, SMALL, 30) for _ in range(2)]
+            _, seconds, received = download.result()
+        result["bulk_mbps"] = round(received * 8 / seconds / 1e6 if seconds else 0.0, 2)
+        result["bulk_runs_mbps"] = [result["bulk_mbps"]]
+        loaded_times = [s for ok, s, _ in loaded if ok]
+        result["loaded_median_s"] = round(statistics.median(loaded_times), 3) if loaded_times else None
+        result["loaded_failures"] = sum(1 for ok, _, _ in loaded if not ok)
+        return result
 
     # Throughput is bytes over time, so a download that hits the limit still counts.
     rates = []
     for _ in range(3):
         _, seconds, received = curl(run, socks, BIG.format(size), BULK_LIMIT_S)
         rates.append(received * 8 / seconds / 1e6 if seconds else 0.0)
-    result["bulk_mb"] = round(size / 1e6, 1)
     result["bulk_mbps"] = round(statistics.median(rates), 2)
     result["bulk_runs_mbps"] = [round(r, 2) for r in rates]
 
@@ -263,15 +277,13 @@ def execute(run, netsim_args, size):
 
 
 def table(results):
-    head = ("| Profile | System | Cold start | Warm median | Warm p90 | 6-way burst | Download "
-            "| Small fetch during download | Failures |")
-    lines = [head, "|" + "---|" * 9]
+    head = "| Profile | System | Cold start | 6-way burst | Download | Small fetch during download | Failures |"
+    lines = [head, "|" + "---|" * 7]
     fmt = lambda v, unit="s": "fail" if v is None else f"{v} {unit}"
     for profile, systems in results.items():
         for system, r in systems.items():
-            failures = r["warm_failures"] + r["burst_failures"] + r["loaded_failures"]
-            lines.append(f"| {profile} | {system} | {fmt(r['cold_s'])} | {fmt(r['warm_median_s'])} "
-                         f"| {fmt(r['warm_p90_s'])} | {fmt(r['burst_max_s'])} | {r['bulk_mbps']} Mbit/s "
+            failures = r["burst_failures"] + r["loaded_failures"]
+            lines.append(f"| {profile} | {system} | {fmt(r['cold_s'])} | {fmt(r['burst_max_s'])} | {r['bulk_mbps']} Mbit/s "
                          f"({r['bulk_mb']} MB) | {fmt(r['loaded_median_s'])} | {failures} |")
     return "\n".join(lines)
 
@@ -287,34 +299,51 @@ def main():
     ap.add_argument("--out", default="/tmp/netsim-out")
     ap.add_argument("--profiles", default=",".join(PROFILES))
     ap.add_argument("--systems", default=",".join(SYSTEMS))
-    ap.add_argument("--sequential", action="store_true", help="run one system at a time on every profile")
+    ap.add_argument("--sequential", action="store_true", help="run one system and profile at a time")
+    ap.add_argument("--quick", action="store_true", help="fewer samples, about 15 s per GEO run, for prototyping")
     opts = ap.parse_args()
     os.makedirs(opts.out, exist_ok=True)
     certs()
 
-    results = {}
+    plans = []  # (run, label, netsim arguments, download size, capped)
+    for name in opts.profiles.split(","):
+        label, netsim_args = PROFILES[name]
+        rate = lambda flag, args=netsim_args: float(args[args.index(flag) + 1])
+        size = int(min(max(rate("-down-rate") * 1e6 / 8 * BULK_SECONDS, 1e6), 10e6))
+        capped = max(rate("-down-rate"), rate("-up-rate")) <= PARALLEL_MAX_MBPS
+        for system in opts.systems.split(","):
+            plans.append((Run(name, system, len(plans) + 1), label, netsim_args, size, capped))
+
+    measured = {}
+
+    def go(plan):
+        run, label, netsim_args, size, _ = plan
+        measured[(label, run.system)] = execute(run, netsim_args, size)
+        say(f"== {label}: {run.system}: {measured[(label, run.system)]}")
+
+    mode = "quick" if opts.quick else "full"
+    say(f"== {len(plans)} runs ({mode}){', one at a time' if opts.sequential else ''}")
     try:
-        for name in opts.profiles.split(","):
-            label, netsim_args = PROFILES[name]
-            rate = lambda flag: float(netsim_args[netsim_args.index(flag) + 1])
-            size = int(min(max(rate("-down-rate") * 1e6 / 8 * BULK_SECONDS, 1e6), 10e6))
-            parallel = not opts.sequential and max(rate("-down-rate"), rate("-up-rate")) <= PARALLEL_MAX_MBPS
-            runs = [Run(name, system, i + 1) for i, system in enumerate(opts.systems.split(","))]
-            say(f"== {label}: {', '.join(r.system for r in runs)}{' in parallel' if parallel else ''}, "
-                f"{size / 1e6:.1f} MB downloads")
-            if parallel:
-                with concurrent.futures.ThreadPoolExecutor(len(runs)) as ex:
-                    measured = list(ex.map(lambda r: execute(r, netsim_args, size), runs))
-            else:
-                measured = [execute(r, netsim_args, size) for r in runs]
-            for r, m in zip(runs, measured):
-                results.setdefault(label, {})[r.system] = m
-                say(f"   {r.system}: {m}")
-            with open(os.path.join(opts.out, "results.json"), "w") as f:
-                json.dump(results, f, indent=2)
+        if opts.sequential:
+            for plan in plans:
+                go(plan)
+        else:
+            capped = [p for p in plans if p[4]]
+            fast = [p for p in plans if not p[4]]
+            with concurrent.futures.ThreadPoolExecutor(len(capped) + 1) as ex:
+                futures = [ex.submit(go, p) for p in capped]
+                futures.append(ex.submit(lambda: [go(p) for p in fast]))
+                for f in futures:
+                    f.result()
     finally:
         for p in procs[::-1]:
             stop(p)
+    results = {}
+    for run, label, *_ in plans:
+        if (label, run.system) in measured:
+            results.setdefault(label, {})[run.system] = measured[(label, run.system)]
+    with open(os.path.join(opts.out, "results.json"), "w") as f:
+        json.dump({"mode": mode, "results": results}, f, indent=2)
     report = table(results)
     with open(os.path.join(opts.out, "results.md"), "w") as f:
         f.write(report + "\n")
