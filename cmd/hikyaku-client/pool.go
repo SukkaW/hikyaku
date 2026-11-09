@@ -338,7 +338,11 @@ func (p *pool) watch(c *carrier) verdict {
 				return goingAway
 			}
 			sinceStream := now.Sub(time.Unix(0, c.lastStream.Load()))
-			if now.Sub(lastPing) >= pingInterval(now.Sub(c.conn.LastData()), sinceStream, c.session.NumStreams()) {
+			// Ticks are healthCheck apart, so half a tick of slack keeps a tick that lands
+			// just short of the interval from pushing the ping to the next one, which would
+			// turn the 0.5 s warm ping into one a second.
+			interval := pingInterval(now.Sub(c.conn.LastData()), sinceStream, c.session.NumStreams())
+			if now.Sub(lastPing) >= interval-healthCheck/2 {
 				lastPing = now
 				c.ping()
 			}
