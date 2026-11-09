@@ -135,6 +135,50 @@ func TestPingInterval(t *testing.T) {
 	}
 }
 
+func TestChoose(t *testing.T) {
+	ms := time.Millisecond
+	cases := []struct {
+		name    string
+		waits   []time.Duration
+		streams []int
+		want    int
+	}{
+		{"a clearly quicker carrier beats fewer streams", []time.Duration{600 * ms, 1200 * ms}, []int{3, 0}, 0},
+		{"within the band, fewest streams wins", []time.Duration{600 * ms, 700 * ms}, []int{3, 0}, 1},
+		{"the band is at least minWaitBand", []time.Duration{30 * ms, 45 * ms}, []int{2, 0}, 1},
+		{"just outside a small band", []time.Duration{30 * ms, 60 * ms}, []int{2, 0}, 0},
+		{"an unknown wait counts as tied", []time.Duration{-1, 600 * ms}, []int{0, 2}, 0},
+		{"all unknown falls back to fewest streams", []time.Duration{-1, -1}, []int{1, 0}, 1},
+		{"equal carriers keep slot order", []time.Duration{600 * ms, 600 * ms}, []int{1, 1}, 0},
+	}
+	for _, c := range cases {
+		if got := choose(c.waits, c.streams); got != c.want {
+			t.Errorf("%s: chose %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestExpectedWait(t *testing.T) {
+	now := time.Now()
+	c := &carrier{pings: make(map[uint32]time.Time), waiting: make(map[*carrierStream]time.Time)}
+	if got := c.expectedWait(now); got >= 0 {
+		t.Fatalf("no samples and nothing outstanding: %s, want unknown", got)
+	}
+	c.sample(600 * time.Millisecond)
+	if got := c.expectedWait(now); got != 600*time.Millisecond {
+		t.Fatalf("latest round trip only: %s, want 600ms", got)
+	}
+	c.pings[1] = now.Add(-2 * time.Second)
+	if got := c.expectedWait(now); got != 2*time.Second {
+		t.Fatalf("with a ping unanswered for 2s: %s, want 2s", got)
+	}
+	delete(c.pings, 1)
+	c.waiting[&carrierStream{}] = now.Add(-time.Second)
+	if got := c.expectedWait(now); got != time.Second {
+		t.Fatalf("with an acknowledgement 1s overdue: %s, want 1s", got)
+	}
+}
+
 // fakeServer accepts carriers and runs smux on them like the real server, but answers
 // no pings; onCarrier runs for each one.
 func fakeServer(t *testing.T, psk string, onCarrier func(*proxy.Conn)) string {

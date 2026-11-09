@@ -31,15 +31,18 @@ const (
 	probeWait    = 5 * time.Second
 	// Pings go out only when a carrier is quiet: often while it was in use recently,
 	// which keeps the server's congestion window from shrinking during reading
-	// pauses, and rarely once idle. A busy carrier still gets one now and then, so its
-	// round trip stays measured under load.
+	// pauses, and rarely once idle. A busy carrier still gets one every second, so its
+	// expected wait stays current under load.
 	quietAfter = 500 * time.Millisecond
 	warmFor    = 30 * time.Second
 	warmPing   = 500 * time.Millisecond
 	coldPing   = 15 * time.Second
-	busyPing   = 5 * time.Second
+	busyPing   = time.Second
 	// deadAfter closes a standby carrier whose ping has gone unanswered this long.
 	deadAfter = 30 * time.Second
+	// minWaitBand is the least a carrier's expected wait may exceed the best one's and
+	// still count as tied; otherwise the band is a quarter of the best.
+	minWaitBand = 20 * time.Millisecond
 )
 
 var errNoCarrier = errors.New("no carrier is ready")
@@ -50,6 +53,7 @@ type carrier struct {
 	conn    *proxy.Conn
 	ready   time.Time
 	rtt     atomic.Int64 // smoothed round trip from pongs and acknowledgements in nanoseconds; 0 until the first
+	latest  atomic.Int64 // the latest of those round trips in nanoseconds; 0 until the first
 
 	lastStream atomic.Int64           // unix nanoseconds when a stream last closed
 	goaway     atomic.Pointer[string] // the server's reason, once it sent GOAWAY
@@ -532,7 +536,7 @@ func (p *pool) pick() *carrier {
 	if p.opened == 0 {
 		p.grow()
 	}
-	best := fewestStreams(p.carriers, func(c *carrier) bool { return c.conn.Acked() })
+	best := quickest(p.carriers)
 	if best != nil && (best.session.NumStreams() > 0 || !p.spare(best)) {
 		// Keep an idle carrier in reserve: open another in the background as soon as
 		// this one takes a stream, so a request that arrives during a long download
@@ -578,6 +582,70 @@ func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 		}
 	}
 	return best
+}
+
+// quickest picks the acknowledged carrier where a new stream should hear back
+// soonest.
+func quickest(carriers []*carrier) *carrier {
+	now := time.Now()
+	var acked []*carrier
+	var waits []time.Duration
+	var streams []int
+	for _, c := range carriers {
+		if c == nil || c.session.IsClosed() || !c.conn.Acked() {
+			continue
+		}
+		acked = append(acked, c)
+		waits = append(waits, c.expectedWait(now))
+		streams = append(streams, c.session.NumStreams())
+	}
+	if len(acked) == 0 {
+		return nil
+	}
+	return acked[choose(waits, streams)]
+}
+
+// choose returns which carrier to use from each one's expected wait, negative when
+// unknown, and stream count. Waits within a band of the best count as tied, and so
+// do unknown ones; among the tied, the fewest streams wins.
+func choose(waits []time.Duration, streams []int) int {
+	fastest := time.Duration(-1)
+	for _, w := range waits {
+		if w >= 0 && (fastest < 0 || w < fastest) {
+			fastest = w
+		}
+	}
+	limit := fastest + max(fastest/4, minWaitBand)
+	best := -1
+	for i, w := range waits {
+		if fastest >= 0 && w > limit {
+			continue
+		}
+		if best < 0 || streams[i] < streams[best] {
+			best = i
+		}
+	}
+	return best
+}
+
+// expectedWait estimates how long a new stream's request would wait for its
+// acknowledgement on c: the latest round trip, or longer while a ping or an
+// acknowledgement has gone unanswered for longer than that, which shows a stall
+// before any reply returns. It is negative while c has neither.
+func (c *carrier) expectedWait(now time.Time) time.Duration {
+	wait := time.Duration(-1)
+	if latest := c.latest.Load(); latest != 0 {
+		wait = time.Duration(latest)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, sent := range c.pings {
+		wait = max(wait, now.Sub(sent))
+	}
+	for _, opened := range c.waiting {
+		wait = max(wait, now.Sub(opened))
+	}
+	return wait
 }
 
 // carrierStream strips the server's acknowledgement and result from the front of a
@@ -637,6 +705,7 @@ func (c *carrier) acknowledged(s *carrierStream, rtt time.Duration) {
 }
 
 func (c *carrier) sample(rtt time.Duration) {
+	c.latest.Store(int64(rtt))
 	if old := c.rtt.Load(); old != 0 {
 		rtt = time.Duration(old) + (rtt-time.Duration(old))/4
 	}
