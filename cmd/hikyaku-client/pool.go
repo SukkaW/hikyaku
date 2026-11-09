@@ -387,9 +387,10 @@ func (p *pool) pick() *carrier {
 		p.grow()
 	}
 	best := fewestStreams(p.carriers, func(c *carrier) bool { return c.conn.Acked() })
-	if best != nil && best.session.NumStreams() > 0 {
-		// No acknowledged carrier is idle: open another in the background for the
-		// next request instead of making this one wait for it.
+	if best != nil && (best.session.NumStreams() > 0 || !p.spare(best)) {
+		// Keep an idle carrier in reserve: open another in the background as soon as
+		// this one takes a stream, so a request that arrives during a long download
+		// gets a carrier of its own instead of queueing behind it.
 		p.grow()
 	}
 	if best == nil {
@@ -401,6 +402,20 @@ func (p *pool) pick() *carrier {
 		best = fewestStreams(p.carriers, nil)
 	}
 	return best
+}
+
+// spare reports whether a slot other than c's has an idle carrier or is still
+// opening one; the caller holds p.mu.
+func (p *pool) spare(c *carrier) bool {
+	for slot := range p.opened {
+		if slot == c.slot {
+			continue
+		}
+		if o := p.carriers[slot]; o == nil || !o.conn.Acked() || o.session.NumStreams() == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
