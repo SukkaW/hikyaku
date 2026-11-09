@@ -1,7 +1,8 @@
 //go:build linux
 
 // Command netsim emulates a network path between two network namespaces, so the
-// kernel's own TCP and QUIC stacks see real delay, random loss and a bandwidth cap.
+// kernel's own TCP and QUIC stacks see real delay, random loss, bandwidth caps,
+// outages, latency spikes and periodic pauses.
 //
 // It creates the namespaces hk-client (10.200.0.1) and hk-server (10.200.0.2), each
 // with a TUN device, and forwards every packet between them. It needs root (or
@@ -38,20 +39,44 @@ const (
 func main() {
 	rtt := flag.Duration("rtt", 620*time.Millisecond, "round-trip delay, split evenly between the two directions")
 	loss := flag.Float64("loss", 0, "round-trip packet loss in percent, spread over both directions")
-	rate := flag.Float64("rate", 0, "bandwidth cap in Mbit/s for each direction (0: none)")
+	downRate := flag.Float64("down-rate", 0, "bandwidth cap in Mbit/s from server to client (0: none)")
+	upRate := flag.Float64("up-rate", 0, "bandwidth cap in Mbit/s from client to server (0: none)")
 	queue := flag.Duration("queue", 250*time.Millisecond, "drop-tail queue in front of the bandwidth cap")
-	seed := flag.Uint64("seed", 1, "seed for the loss pattern")
+	outageEvery := flag.Duration("outage-every", 0, "mean time between outages that drop everything both ways (0: none)")
+	outageFor := flag.Duration("outage-for", 0, "mean outage length")
+	spikeEvery := flag.Duration("spike-every", 0, "mean time between latency spikes (0: none)")
+	spikeFor := flag.Duration("spike-for", 0, "length of each latency spike")
+	spikeMin := flag.Duration("spike-min", 0, "smallest extra round-trip delay during a spike")
+	spikeMax := flag.Duration("spike-max", 0, "largest extra round-trip delay during a spike")
+	pauseEvery := flag.Duration("pause-every", 0, "period of short pauses in which the path sends nothing (0: none)")
+	pauseDown := flag.Duration("pause-down", 0, "pause length from server to client")
+	pauseUp := flag.Duration("pause-up", 0, "pause length from client to server")
+	seed := flag.Uint64("seed", 1, "seed for the loss, outage and spike patterns")
 	flag.Parse()
 
 	// Losing L of round trips means each direction drops p, where (1-p)^2 = 1-L.
 	perDirection := 1 - math.Sqrt(1-*loss/100)
-	link := func(stream uint64) *link {
+	epoch := time.Now()
+	outages := newEvents(*seed, 3, *outageEvery,
+		func(r *rand.Rand) time.Duration { return exponential(r, *outageFor) },
+		func(*rand.Rand) time.Duration { return 1 })
+	spikes := newEvents(*seed, 4, *spikeEvery,
+		func(*rand.Rand) time.Duration { return *spikeFor },
+		func(r *rand.Rand) time.Duration {
+			return *spikeMin + time.Duration(r.Float64()*float64(*spikeMax-*spikeMin))
+		})
+	link := func(stream uint64, rate float64, pause time.Duration) *link {
 		return &link{
-			delay: *rtt / 2,
-			loss:  perDirection,
-			rate:  *rate * 1e6 / 8,
-			queue: *queue,
-			rng:   rand.New(rand.NewPCG(*seed, stream)),
+			delay:      *rtt / 2,
+			loss:       perDirection,
+			rate:       rate * 1e6 / 8,
+			queue:      *queue,
+			rng:        rand.New(rand.NewPCG(*seed, stream)),
+			outages:    outages,
+			spikes:     spikes,
+			epoch:      epoch,
+			pauseEvery: *pauseEvery,
+			pause:      pause,
 		}
 	}
 
@@ -67,8 +92,8 @@ func main() {
 				err = configure(serverNS, "hks", serverAddr, clientAddr)
 			}
 			if err == nil {
-				go link(1).forward(clientTUN, serverTUN)
-				go link(2).forward(serverTUN, clientTUN)
+				go link(1, *upRate, *pauseUp).forward(clientTUN, serverTUN)
+				go link(2, *downRate, *pauseDown).forward(serverTUN, clientTUN)
 			}
 		}
 	}
@@ -76,8 +101,18 @@ func main() {
 		teardown()
 		log.Fatal(err)
 	}
-	fmt.Printf("netsim: rtt %s, %.2f%% loss per round trip (%.2f%% each way), %s each way, %s queue; ready\n",
-		*rtt, *loss, perDirection*100, rateString(*rate), *queue)
+	fmt.Printf("netsim: rtt %s, %.4f%% loss per round trip (%.4f%% each way), down %s, up %s, %s queue",
+		*rtt, *loss, perDirection*100, rateString(*downRate), rateString(*upRate), *queue)
+	if *outageEvery > 0 {
+		fmt.Printf(", outages of ~%s every ~%s", *outageFor, *outageEvery)
+	}
+	if *spikeEvery > 0 {
+		fmt.Printf(", +%s–%s spikes for %s every ~%s", *spikeMin, *spikeMax, *spikeFor, *spikeEvery)
+	}
+	if *pauseEvery > 0 {
+		fmt.Printf(", pauses of %s down / %s up every %s", *pauseDown, *pauseUp, *pauseEvery)
+	}
+	fmt.Println("; ready")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -173,14 +208,78 @@ func createTUN(name string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), name), nil
 }
 
-// link is one direction of the path: random loss, then a bandwidth cap with a
-// drop-tail queue, then a fixed propagation delay.
+// link is one direction of the path: outages and random loss, then a bandwidth cap
+// with a drop-tail queue that also holds packets through pauses, then the
+// propagation delay plus any latency spike.
 type link struct {
 	delay time.Duration
 	loss  float64
 	rate  float64 // bytes per second; 0 means no cap
 	queue time.Duration
 	rng   *rand.Rand
+
+	outages, spikes *events // shared by both directions
+	epoch           time.Time
+	pauseEvery      time.Duration
+	pause           time.Duration
+}
+
+// resume returns when the path can send again if t falls inside a pause.
+func (l *link) resume(t time.Time) time.Time {
+	if l.pauseEvery == 0 || l.pause == 0 {
+		return t
+	}
+	if into := t.Sub(l.epoch) % l.pauseEvery; into < l.pause {
+		return t.Add(l.pause - into)
+	}
+	return t
+}
+
+// events is an on/off process in wall-clock time with exponentially distributed
+// gaps, such as outages or latency spikes. Its state is shared by both directions.
+type events struct {
+	mu      sync.Mutex
+	rng     *rand.Rand
+	gap     time.Duration // mean time between events; 0 disables them
+	length  func(*rand.Rand) time.Duration
+	size    func(*rand.Rand) time.Duration
+	active  bool
+	current time.Duration
+	until   time.Time
+}
+
+func newEvents(seed, stream uint64, gap time.Duration, length, size func(*rand.Rand) time.Duration) *events {
+	return &events{rng: rand.New(rand.NewPCG(seed, stream)), gap: gap, length: length, size: size}
+}
+
+func exponential(r *rand.Rand, mean time.Duration) time.Duration {
+	return time.Duration(r.ExpFloat64() * float64(mean))
+}
+
+// at returns the size of the event in progress at t, or 0 between events.
+func (e *events) at(t time.Time) time.Duration {
+	if e.gap == 0 {
+		return 0
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.until.IsZero() {
+		e.until = t.Add(exponential(e.rng, e.gap))
+	}
+	for !t.Before(e.until) {
+		if e.active {
+			e.active = false
+			e.until = e.until.Add(exponential(e.rng, e.gap))
+		} else {
+			e.active = true
+			e.current = e.size(e.rng)
+			e.until = e.until.Add(e.length(e.rng))
+		}
+	}
+	if e.active {
+		return e.current
+	}
+	return 0
 }
 
 type packet struct {
@@ -195,28 +294,29 @@ var buffers = sync.Pool{New: func() any {
 }}
 
 func (l *link) forward(src, dst *os.File) {
-	// Departure times only move forward and the delay is fixed, so packets come due
-	// in arrival order and a FIFO is enough to schedule them.
+	// Due times are kept in arrival order, even when a spike ends, so a FIFO is
+	// enough to schedule them and the path never reorders packets.
 	out := make(chan packet, 1<<16)
 	go deliver(dst, out)
-	var busyUntil time.Time
+	var busyUntil, lastDue time.Time
 	for {
 		buf := buffers.Get().(*[]byte)
 		n, err := src.Read(*buf)
 		if err != nil {
 			log.Fatalf("read %s: %v", src.Name(), err)
 		}
-		if l.loss > 0 && l.rng.Float64() < l.loss {
+		now := time.Now()
+		if l.outages.at(now) > 0 || (l.loss > 0 && l.rng.Float64() < l.loss) {
 			buffers.Put(buf)
 			continue
 		}
-		now := time.Now()
-		depart := now
+		start := now
+		if busyUntil.After(start) {
+			start = busyUntil
+		}
+		start = l.resume(start)
+		depart := start
 		if l.rate > 0 {
-			start := now
-			if busyUntil.After(now) {
-				start = busyUntil
-			}
 			if start.Sub(now) > l.queue {
 				buffers.Put(buf)
 				continue
@@ -224,7 +324,12 @@ func (l *link) forward(src, dst *os.File) {
 			busyUntil = start.Add(time.Duration(float64(n) / l.rate * float64(time.Second)))
 			depart = busyUntil
 		}
-		out <- packet{data: (*buf)[:n], buf: buf, due: depart.Add(l.delay)}
+		due := depart.Add(l.delay + l.spikes.at(now)/2)
+		if due.Before(lastDue) {
+			due = lastDue
+		}
+		lastDue = due
+		out <- packet{data: (*buf)[:n], buf: buf, due: due}
 	}
 }
 

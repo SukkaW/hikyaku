@@ -18,12 +18,40 @@ import subprocess
 import sys
 import time
 
+
+def each_way(percent):
+    """netsim's -loss is per round trip; convert a per-direction loss rate to it."""
+    return f"{(1 - (1 - percent / 100) ** 2) * 100:.6f}"
+
+
+# name: (label, netsim arguments). The first four are synthetic paths, with 620 ms /
+# 10% uniform loss kept as a harsh stress test. The rest approximate measured in-flight
+# Wi-Fi: GEO round trips of 620-750 ms with little random loss, and Starlink with
+# 30-65 ms; outage, spike and queue settings are engineering estimates.
 PROFILES = {
-    "10ms": ("10ms", 0, 500),
-    "50ms": ("50ms", 0, 500),
-    "200ms": ("200ms", 5, 100),
-    "620ms": ("620ms", 10, 5),
+    "10ms": ("10 ms, 0% loss, 500 Mbit/s", ["-rtt", "10ms", "-down-rate", "500", "-up-rate", "500"]),
+    "50ms": ("50 ms, 0% loss, 500 Mbit/s", ["-rtt", "50ms", "-down-rate", "500", "-up-rate", "500"]),
+    "200ms": ("200 ms, 5% loss, 100 Mbit/s", ["-rtt", "200ms", "-loss", "5", "-down-rate", "100", "-up-rate", "100"]),
+    "620ms": ("Harsh stress: 620 ms, 10% uniform loss, 5 Mbit/s",
+              ["-rtt", "620ms", "-loss", "10", "-down-rate", "5", "-up-rate", "5"]),
+    "geo-healthy": ("Healthy GEO: 700 ms, 0.05% loss each way, 50/4 Mbit/s",
+                    ["-rtt", "700ms", "-loss", each_way(0.05), "-down-rate", "50", "-up-rate", "4", "-queue", "100ms"]),
+    "geo-congested": ("Congested GEO: 620 ms, queue drops only, 5.9/3.9 Mbit/s",
+                      ["-rtt", "620ms", "-down-rate", "5.9", "-up-rate", "3.9", "-queue", "250ms"]),
+    "geo-impaired": ("Impaired GEO: 750 ms, 0.1% loss each way, ~10 s blackouts every ~90 s, 5/1 Mbit/s",
+                     ["-rtt", "750ms", "-loss", each_way(0.1), "-outage-every", "90s", "-outage-for", "10s",
+                      "-down-rate", "5", "-up-rate", "1", "-queue", "250ms"]),
+    "starlink": ("Starlink continental: 30 ms, 0.02% loss each way, 125/15 Mbit/s, cabin spikes, 15 s pauses",
+                 ["-rtt", "30ms", "-loss", each_way(0.02), "-down-rate", "125", "-up-rate", "15", "-queue", "150ms",
+                  "-spike-every", "60s", "-spike-for", "600ms", "-spike-min", "200ms", "-spike-max", "450ms",
+                  "-pause-every", "15s", "-pause-down", "45ms", "-pause-up", "68ms"]),
+    "starlink-oceanic": ("Starlink oceanic: 65 ms, 0.02% loss each way, ~1 s blackout every ~10 min, 65/24 Mbit/s",
+                         ["-rtt", "65ms", "-loss", each_way(0.02), "-outage-every", "10m", "-outage-for", "1s",
+                          "-down-rate", "65", "-up-rate", "24", "-queue", "150ms"]),
 }
+# hikyaku client log lines that mark a carrier health decision.
+CARRIER_EVENTS = {"slow": "slower than", "pong overdue": "pong overdue", "silent": "silent for",
+                  "no acknowledgement": "no acknowledgement", "link probing": "probing"}
 SERVER = "10.200.0.2"
 SMALL = "https://localhost:9443/"
 BIG = "http://localhost:9001/big?n=10000000"
@@ -31,14 +59,19 @@ ENV = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 procs = []
+run_prefix = ""  # set per profile so every profile keeps its own logs
 
 
 def say(msg):
     print(msg, flush=True)
 
 
+def log_path(name):
+    return os.path.join(opts.out, f"{run_prefix}{name}.log")
+
+
 def spawn(args, name, ns=None, env=None):
-    log = open(os.path.join(opts.out, name + ".log"), "w")
+    log = open(log_path(name), "w")
     cmd = (["ip", "netns", "exec", ns] if ns else []) + args
     p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env={**ENV, **(env or {})},
                          start_new_session=True)
@@ -60,7 +93,7 @@ def stop(p):
 def wait_for(name, needle, timeout):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        with open(os.path.join(opts.out, name + ".log")) as f:
+        with open(log_path(name)) as f:
             if needle in f.read():
                 return
         time.sleep(0.1)
@@ -201,7 +234,7 @@ def table(results):
 
 
 def main():
-    global opts
+    global opts, run_prefix
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--netsim", default="/usr/local/bin/netsim")
     ap.add_argument("--hikyaku", default="/usr/local/bin", help="directory with hikyaku-server and hikyaku-client")
@@ -218,10 +251,10 @@ def main():
     results = {}
     try:
         for name in opts.profiles.split(","):
-            rtt, loss, rate = PROFILES[name]
-            label = f"{rtt}, {loss}% loss, {rate} Mbit/s"
-            sim = spawn([opts.netsim, "-rtt", rtt, "-loss", str(loss), "-rate", str(rate)], f"netsim-{name}")
-            wait_for(f"netsim-{name}", "ready", 10)
+            label, netsim_args = PROFILES[name]
+            run_prefix = f"{name}-"
+            sim = spawn([opts.netsim, *netsim_args], "netsim")
+            wait_for("netsim", "ready", 10)
             origin = spawn(["python3", os.path.join(HERE, "origin.py"), os.path.join(opts.certs, "leaf.pem"),
                             os.path.join(opts.certs, "leaf.key")], "origin", "hk-server")
             wait_for("origin", "origin ready", 10)
@@ -231,6 +264,10 @@ def main():
                 start_client, socks = SYSTEMS[system]()
                 time.sleep(1)
                 results.setdefault(label, {})[system] = measure(start_client, socks)
+                if system == "hikyaku":
+                    with open(log_path("hikyaku-client")) as f:
+                        log = f.read()
+                    results[label][system]["carrier_events"] = {k: log.count(v) for k, v in CARRIER_EVENTS.items()}
                 say(f"   {results[label][system]}")
                 for p in procs[started:][::-1]:
                     stop(p)
