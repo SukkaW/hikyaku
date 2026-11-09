@@ -12,9 +12,6 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/protocol/socks"
 )
 
 // stallingOrigin never answers its first connection and answers "ok" on later ones,
@@ -67,10 +64,10 @@ func TestReplay(t *testing.T) {
 		}
 		t.Cleanup(func() { ln.Close() })
 		go (&inbound{pool: p}).serve(ln)
-		client := socks.NewClient(N.SystemDialer, M.ParseSocksaddr(ln.Addr().String()), socks.Version5, "", "")
+		client := socksClient{addr: ln.Addr().String()}
 
 		origin, received := stallingOrigin(t, len(firstFlight))
-		conn, err := client.DialContext(context.Background(), "tcp", M.ParseSocksaddr(origin))
+		conn, err := client.DialContext(context.Background(), "tcp", origin)
 		if err != nil {
 			t.Fatal(err)
 		}

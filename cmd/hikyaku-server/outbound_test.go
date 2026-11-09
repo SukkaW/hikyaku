@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/uot"
+	"github.com/things-go/go-socks5/statute"
 	"github.com/xtaci/smux"
 )
 
-func openStream(t *testing.T, allowPrivate bool, destination M.Socksaddr) *smux.Stream {
+func openStream(t *testing.T, allowPrivate bool, destination statute.AddrSpec) *smux.Stream {
 	t.Helper()
 	psk := make([]byte, proxy.PSKSize)
 	rand.Read(psk)
@@ -42,10 +41,19 @@ func openStream(t *testing.T, allowPrivate bool, destination M.Socksaddr) *smux.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := M.SocksaddrSerializer.WriteAddrPort(stream, destination); err != nil {
+	if err := proxy.WriteRequest(stream, destination); err != nil {
 		t.Fatal(err)
 	}
 	return stream
+}
+
+func addrOf(t *testing.T, addr net.Addr) statute.AddrSpec {
+	t.Helper()
+	spec, err := statute.ParseAddrSpec(addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return spec
 }
 
 func TestTCPTarget(t *testing.T) {
@@ -64,7 +72,7 @@ func TestTCPTarget(t *testing.T) {
 			accepted <- c
 		}
 	}()
-	destination := M.SocksaddrFromNet(target.Addr())
+	destination := addrOf(t, target.Addr())
 
 	t.Run("refused", func(t *testing.T) {
 		stream := openStream(t, false, destination)
@@ -124,22 +132,27 @@ func TestUDPTarget(t *testing.T) {
 			echo.WriteTo(buf[:n], addr)
 		}
 	}()
-	destination := M.SocksaddrFromNet(echo.LocalAddr())
 
 	roundTrip := func(t *testing.T, allowPrivate bool) error {
-		stream := openStream(t, allowPrivate, uot.RequestDestination(uot.Version))
+		stream := openStream(t, allowPrivate, proxy.UDPRequest)
 		readPong(t, stream)
-		conn := uot.NewLazyConn(stream, uot.Request{Destination: destination})
-		if _, err := conn.WriteTo([]byte("ping"), echo.LocalAddr()); err != nil {
+		datagram, err := statute.NewDatagram(echo.LocalAddr().String(), []byte("ping"))
+		if err != nil {
 			t.Fatal(err)
 		}
-		conn.SetReadDeadline(time.Now().Add(time.Second))
-		got := make([]byte, 16)
-		n, _, err := conn.ReadFrom(got)
-		if err == nil && string(got[:n]) != "ping" {
-			t.Fatalf("echo returned %q", got[:n])
+		if err := proxy.WritePacket(stream, datagram.Bytes()); err != nil {
+			t.Fatal(err)
 		}
-		return err
+		stream.SetReadDeadline(time.Now().Add(time.Second))
+		p, err := proxy.ReadPacket(stream, make([]byte, proxy.MaxPacket))
+		if err != nil {
+			return err
+		}
+		reply, err := statute.ParseDatagram(p)
+		if err != nil || string(reply.Data) != "ping" || reply.DstAddr.String() != echo.LocalAddr().String() {
+			t.Fatalf("echo returned %q from %s, %v", reply.Data, reply.DstAddr.String(), err)
+		}
+		return nil
 	}
 
 	t.Run("refused", func(t *testing.T) {

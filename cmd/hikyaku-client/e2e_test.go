@@ -16,9 +16,7 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/protocol/socks"
+	"github.com/things-go/go-socks5/statute"
 )
 
 func startServer(t *testing.T, psk string) string {
@@ -58,7 +56,7 @@ func startServer(t *testing.T, psk string) string {
 	}
 }
 
-func startClient(t *testing.T, server string, psk []byte) *socks.Client {
+func startClient(t *testing.T, server string, psk []byte) socksClient {
 	t.Helper()
 	p := newPool(server, psk, 2)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -67,7 +65,7 @@ func startClient(t *testing.T, server string, psk []byte) *socks.Client {
 	}
 	t.Cleanup(func() { ln.Close() })
 	go (&inbound{pool: p}).serve(ln)
-	return socks.NewClient(N.SystemDialer, M.ParseSocksaddr(ln.Addr().String()), socks.Version5, "", "")
+	return socksClient{addr: ln.Addr().String()}
 }
 
 func TestEndToEnd(t *testing.T) {
@@ -82,9 +80,7 @@ func TestEndToEnd(t *testing.T) {
 		}))
 		defer origin.Close()
 		httpClient := &http.Client{Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return client.DialContext(ctx, network, M.ParseSocksaddr(addr))
-			},
+			DialContext: client.DialContext,
 		}}
 		resp, err := httpClient.Get(origin.URL)
 		if err != nil {
@@ -118,7 +114,7 @@ func TestEndToEnd(t *testing.T) {
 				}
 			}
 		}()
-		conn, err := client.DialContext(context.Background(), "tcp", M.ParseSocksaddr(origin.Addr().String()))
+		conn, err := client.DialContext(context.Background(), "tcp", origin.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -149,19 +145,32 @@ func TestEndToEnd(t *testing.T) {
 				echo.WriteTo(buf[:n], addr)
 			}
 		}()
-		pc, err := client.ListenPacket(context.Background(), M.SocksaddrFromNet(echo.LocalAddr()))
+		control, relay, err := client.associate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer control.Close()
+		pc, err := net.DialUDP("udp", nil, relay)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer pc.Close()
-		if _, err := pc.WriteTo([]byte("ping"), echo.LocalAddr()); err != nil {
+		datagram, err := statute.NewDatagram(echo.LocalAddr().String(), []byte("ping"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pc.Write(datagram.Bytes()); err != nil {
 			t.Fatal(err)
 		}
 		pc.SetReadDeadline(time.Now().Add(5 * time.Second))
-		got := make([]byte, 16)
-		n, _, err := pc.ReadFrom(got)
-		if err != nil || string(got[:n]) != "ping" {
-			t.Fatalf("udp echo %q, %v", got[:n], err)
+		got := make([]byte, 64)
+		n, err := pc.Read(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reply, err := statute.ParseDatagram(got[:n])
+		if err != nil || string(reply.Data) != "ping" || reply.DstAddr.String() != echo.LocalAddr().String() {
+			t.Fatalf("udp echo %q from %s, %v; want ping from %s", reply.Data, reply.DstAddr.String(), err, echo.LocalAddr())
 		}
 	})
 }

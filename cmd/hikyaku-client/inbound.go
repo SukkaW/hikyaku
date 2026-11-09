@@ -1,80 +1,142 @@
 package main
 
 import (
-	std_bufio "bufio"
 	"context"
+	"errors"
+	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	"github.com/sagernet/sing/common/bufio"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/uot"
-	"github.com/sagernet/sing/protocol/socks"
+	"github.com/things-go/go-socks5"
+	"github.com/things-go/go-socks5/statute"
 )
 
 const udpTimeout = 5 * time.Minute
+
+var errNotConn = errors.New("SOCKS5 writer is not a connection")
 
 type inbound struct {
 	pool *pool
 }
 
 func (h *inbound) serve(ln net.Listener) error {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go h.serveConn(conn)
-	}
+	server := socks5.NewServer(
+		socks5.WithResolver(remoteResolver{}),
+		socks5.WithConnectHandle(h.connect),
+		socks5.WithAssociateHandle(h.associate),
+	)
+	return server.Serve(ln)
 }
 
-func (h *inbound) serveConn(conn net.Conn) {
-	reader := std_bufio.NewReader(conn)
-	// sing parses the request from reader but relays conn, so anything a client
-	// pipelines after its request must be read back through the same buffer.
-	buffered := &bufferedConn{Conn: conn, reader: reader}
-	err := socks.HandleConnectionEx(context.Background(), buffered, reader, nil, h, nil, udpTimeout, M.SocksaddrFromNet(conn.RemoteAddr()), nil)
-	if err != nil {
-		conn.Close()
-	}
+// remoteResolver leaves domain names alone, so the hikyaku server resolves them
+// instead of the cabin's DNS, and no round trip is spent before the stream opens.
+type remoteResolver struct{}
+
+func (remoteResolver) Resolve(ctx context.Context, _ string) (context.Context, net.IP, error) {
+	return ctx, nil, nil
 }
 
-func (h *inbound) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr, destination M.Socksaddr, _ N.CloseHandlerFunc) {
-	stream, err := newReplayStream(h, destination)
-	if err != nil {
-		N.ReportHandshakeFailure(conn, err)
-		conn.Close()
-		return
+func (h *inbound) connect(_ context.Context, writer io.Writer, request *socks5.Request) error {
+	conn, ok := writer.(net.Conn)
+	if !ok {
+		return errNotConn
 	}
-	// sing's lazy SOCKS reply is not safe for the relay's concurrent first Read
-	// and Write, so send it before relaying; it still does not wait for the server.
-	if err := N.ReportConnHandshakeSuccess(conn, stream); err != nil {
-		conn.Close()
+	stream, err := newReplayStream(h, *request.DestAddr)
+	if err != nil {
+		socks5.SendReply(writer, statute.RepHostUnreachable, nil)
+		return err
+	}
+	// Reply without waiting for the server, so the app's first bytes ride the stream's
+	// first flight.
+	if err := socks5.SendReply(writer, statute.RepSuccess, request.LocalAddr); err != nil {
 		stream.Close()
-		return
+		return err
 	}
-	proxy.Relay(conn, stream)
+	// go-socks5 parsed the request through request.Reader, which may already hold
+	// bytes the client sent right behind it.
+	proxy.Relay(&bufferedConn{Conn: conn, reader: request.Reader}, stream)
+	return nil
 }
 
-func (h *inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, destination M.Socksaddr, _ N.CloseHandlerFunc) {
-	_, stream, err := h.open(uot.RequestDestination(uot.Version))
-	if err != nil {
-		conn.Close()
-		return
+// associate relays a SOCKS5 UDP association over one udp-over-tcp stream. It lasts
+// as long as the client's control connection (RFC 1928 section 7), or until no
+// packet has come from the client for udpTimeout.
+func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5.Request) error {
+	conn, ok := writer.(net.Conn)
+	if !ok {
+		return errNotConn
 	}
-	bufio.CopyPacketConn(ctx, conn, uot.NewLazyConn(stream, uot.Request{Destination: destination}))
+	local, _ := request.LocalAddr.(*net.TCPAddr)
+	peer, _ := request.RemoteAddr.(*net.TCPAddr)
+	if local == nil || peer == nil {
+		socks5.SendReply(writer, statute.RepServerFailure, nil)
+		return errNotConn
+	}
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: local.IP})
+	if err != nil {
+		socks5.SendReply(writer, statute.RepServerFailure, nil)
+		return err
+	}
+	defer udp.Close()
+	_, stream, err := h.open(proxy.UDPRequest)
+	if err != nil {
+		socks5.SendReply(writer, statute.RepServerFailure, nil)
+		return err
+	}
+	defer stream.Close()
+	if err := socks5.SendReply(writer, statute.RepSuccess, udp.LocalAddr()); err != nil {
+		return err
+	}
+
+	var client atomic.Pointer[net.UDPAddr]
+	go func() {
+		defer conn.Close()
+		buf := make([]byte, proxy.MaxPacket)
+		for {
+			udp.SetReadDeadline(time.Now().Add(udpTimeout))
+			n, from, err := udp.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if !from.IP.Equal(peer.IP) {
+				continue
+			}
+			if d, err := statute.ParseDatagram(buf[:n]); err != nil || d.Frag != 0 {
+				continue
+			}
+			client.Store(from)
+			if proxy.WritePacket(stream, buf[:n]) != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer conn.Close()
+		buf := make([]byte, proxy.MaxPacket)
+		for {
+			p, err := proxy.ReadPacket(stream, buf)
+			if err != nil {
+				return
+			}
+			if to := client.Load(); to != nil {
+				udp.WriteToUDP(p, to)
+			}
+		}
+	}()
+	io.Copy(io.Discard, request.Reader)
+	return nil
 }
 
 // open writes the destination as soon as the stream exists, so protocols where
 // the server speaks first still reach it.
-func (h *inbound) open(destination M.Socksaddr) (*carrier, *carrierStream, error) {
+func (h *inbound) open(destination statute.AddrSpec) (*carrier, *carrierStream, error) {
 	c, stream, err := h.pool.openStream()
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := M.SocksaddrSerializer.WriteAddrPort(stream, destination); err != nil {
+	if err := proxy.WriteRequest(stream, destination); err != nil {
 		stream.Close()
 		return nil, nil, err
 	}
@@ -83,7 +145,7 @@ func (h *inbound) open(destination M.Socksaddr) (*carrier, *carrierStream, error
 
 type bufferedConn struct {
 	net.Conn
-	reader *std_bufio.Reader
+	reader io.Reader
 }
 
 func (c *bufferedConn) Read(b []byte) (int, error) {

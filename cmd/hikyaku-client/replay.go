@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/things-go/go-socks5/statute"
 )
 
 const (
@@ -21,7 +21,7 @@ const (
 // starts a fresh TLS session at the origin, while a plain request could run twice.
 type replayStream struct {
 	h           *inbound
-	destination M.Socksaddr
+	destination statute.AddrSpec
 
 	stream     atomic.Pointer[carrierStream]
 	carrier    atomic.Pointer[carrier]
@@ -36,7 +36,7 @@ type replayStream struct {
 	replays int
 }
 
-func newReplayStream(h *inbound, destination M.Socksaddr) (*replayStream, error) {
+func newReplayStream(h *inbound, destination statute.AddrSpec) (*replayStream, error) {
 	r := &replayStream{h: h, destination: destination}
 	if err := r.attach(); err != nil {
 		return nil, err

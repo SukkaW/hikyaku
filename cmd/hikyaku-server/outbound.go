@@ -10,11 +10,7 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/uot"
+	"github.com/things-go/go-socks5/statute"
 	"github.com/xtaci/smux"
 )
 
@@ -57,7 +53,7 @@ func public(addr netip.Addr) bool {
 func (o *outbound) handle(stream *smux.Stream) {
 	defer stream.Close()
 	stream.SetReadDeadline(time.Now().Add(headerTimeout))
-	destination, err := M.SocksaddrSerializer.ReadAddrPort(stream)
+	destination, err := proxy.ReadRequest(stream)
 	if err != nil {
 		return
 	}
@@ -66,63 +62,92 @@ func (o *outbound) handle(stream *smux.Stream) {
 		return
 	}
 
-	if destination.Fqdn == uot.MagicAddress {
+	if destination.FQDN == proxy.UDPDestination {
 		o.relayUDP(stream)
 		return
 	}
 	conn, err := o.dialer.DialContext(context.Background(), "tcp", destination.String())
 	if err != nil {
-		log.Printf("dial %s: %v", destination, err)
+		log.Printf("dial %s: %v", destination.String(), err)
 		return
 	}
 	proxy.Relay(conn, stream)
 }
 
+// relayUDP serves a udp-over-tcp stream from one UDP socket: packets from the stream
+// go out to their destinations, and replies come back tagged with their source.
 func (o *outbound) relayUDP(stream net.Conn) {
-	request, err := uot.ReadRequest(stream)
-	if err != nil {
-		return
-	}
-	udp, err := net.ListenPacket("udp", "")
+	udp, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		log.Printf("udp: %v", err)
 		return
 	}
-	remote := &guardedPacketConn{
-		NetPacketConn: bufio.NewPacketConn(udp),
-		allowPrivate:  o.allowPrivate,
-		resolved:      make(map[string]netip.Addr),
-	}
-	bufio.CopyPacketConn(context.Background(), uot.NewConn(stream, *request), remote)
-}
-
-// guardedPacketConn applies the destination policy to every datagram. WritePacket
-// is only called from the single upload goroutine of CopyPacketConn, so the
-// per-association resolve cache needs no lock.
-type guardedPacketConn struct {
-	N.NetPacketConn
-	allowPrivate bool
-	resolved     map[string]netip.Addr
-}
-
-func (c *guardedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if destination.IsDomain() {
-		addr, ok := c.resolved[destination.Fqdn]
-		if !ok {
-			addr, ok = resolve(destination.Fqdn)
-			if !ok {
-				buffer.Release()
-				return nil
+	defer udp.Close()
+	go func() {
+		defer stream.Close()
+		buf := make([]byte, proxy.MaxPacket)
+		for {
+			n, from, err := udp.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
 			}
-			c.resolved[destination.Fqdn] = addr
+			reply := statute.Datagram{DstAddr: addrSpec(from), Data: buf[:n]}
+			if proxy.WritePacket(stream, reply.Bytes()) != nil {
+				return
+			}
 		}
-		destination = M.SocksaddrFrom(addr, destination.Port)
+	}()
+	// Only this goroutine sends, so the per-association resolve cache needs no lock.
+	resolved := make(map[string]netip.Addr)
+	buf := make([]byte, proxy.MaxPacket)
+	for {
+		p, err := proxy.ReadPacket(stream, buf)
+		if err != nil {
+			return
+		}
+		d, err := statute.ParseDatagram(p)
+		if err != nil || d.Frag != 0 {
+			continue
+		}
+		if to, ok := o.udpTarget(d.DstAddr, resolved); ok {
+			udp.WriteToUDPAddrPort(d.Data, to)
+		}
 	}
-	if !c.allowPrivate && !public(destination.Addr) {
-		buffer.Release()
-		return nil
+}
+
+// udpTarget applies the destination policy to a datagram, resolving names once per
+// association.
+func (o *outbound) udpTarget(dst statute.AddrSpec, resolved map[string]netip.Addr) (netip.AddrPort, bool) {
+	var addr netip.Addr
+	if dst.FQDN != "" {
+		var ok bool
+		addr, ok = resolved[dst.FQDN]
+		if !ok {
+			if addr, ok = resolve(dst.FQDN); !ok {
+				return netip.AddrPort{}, false
+			}
+			resolved[dst.FQDN] = addr
+		}
+	} else {
+		var ok bool
+		if addr, ok = netip.AddrFromSlice(dst.IP); !ok {
+			return netip.AddrPort{}, false
+		}
+		addr = addr.Unmap()
 	}
-	return c.NetPacketConn.WritePacket(buffer, destination)
+	if !o.allowPrivate && !public(addr) {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(addr, uint16(dst.Port)), true
+}
+
+func addrSpec(ap netip.AddrPort) statute.AddrSpec {
+	addr := ap.Addr().Unmap()
+	spec := statute.AddrSpec{IP: addr.AsSlice(), Port: int(ap.Port()), AddrType: statute.ATYPIPv6}
+	if addr.Is4() {
+		spec.AddrType = statute.ATYPIPv4
+	}
+	return spec
 }
 
 func resolve(host string) (netip.Addr, bool) {
