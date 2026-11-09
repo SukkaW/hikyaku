@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Compare hikyaku, satmux and TUIC v5 over netsim's emulated paths.
 
-Run as root on Linux (see tools/netsim/Dockerfile). For each profile it starts
-netsim, runs every server and the test website in the hk-server namespace and every
-client in hk-client, and measures through each system's SOCKS5 port: cold start,
-20 warm small HTTPS fetches, a 6-way burst, 10 MB downloads, and small fetches
-during a download.
+Run as root on Linux (see tools/netsim/Dockerfile). Every system gets its own netsim
+instance per profile, with its server and the test website in that instance's server
+namespace and its client in the client namespace. It measures through each system's
+SOCKS5 port: cold start, 20 warm small HTTPS fetches, a 6-way burst, downloads sized
+to about 8 s at the profile's download cap (1-10 MB), and small fetches during a
+download. On profiles capped at 100 Mbit/s or less the systems run in parallel, since
+their paths are separate and the CPU is not the bottleneck there.
 """
 import argparse
 import concurrent.futures
@@ -16,6 +18,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -52,30 +55,45 @@ PROFILES = {
 # hikyaku client log lines that mark a carrier health decision.
 CARRIER_EVENTS = {"slow": "slower than", "pong overdue": "pong overdue", "silent": "silent for",
                   "no acknowledgement": "no acknowledgement", "link probing": "probing"}
-SERVER = "10.200.0.2"
 SMALL = "https://localhost:9443/"
-BIG = "http://localhost:9001/big?n=10000000"
+BIG = "http://localhost:9001/big?n={}"
+BULK_SECONDS = 8
+BULK_LIMIT_S = 20
+PARALLEL_MAX_MBPS = 100
 ENV = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 procs = []
-run_prefix = ""  # set per profile so every profile keeps its own logs
+procs_lock = threading.Lock()
+
+
+class Run:
+    """One system on one profile, on its own netsim instance and test website."""
+
+    def __init__(self, profile, system, instance):
+        self.profile, self.system, self.instance = profile, system, instance
+        suffix = f"-{instance}" if instance else ""
+        self.client_ns, self.server_ns = f"hk-client{suffix}", f"hk-server{suffix}"
+        self.server = f"10.200.{instance}.2"
+        self.procs = []
+
+    def path(self, name):
+        return os.path.join(opts.out, f"{self.profile}-{self.system}-{name}")
 
 
 def say(msg):
     print(msg, flush=True)
 
 
-def log_path(name):
-    return os.path.join(opts.out, f"{run_prefix}{name}.log")
-
-
-def spawn(args, name, ns=None, env=None):
-    log = open(log_path(name), "w")
+def spawn(run, args, name, side=None, env=None):
+    log = open(run.path(name + ".log"), "w")
+    ns = {"client": run.client_ns, "server": run.server_ns}.get(side)
     cmd = (["ip", "netns", "exec", ns] if ns else []) + args
     p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env={**ENV, **(env or {})},
                          start_new_session=True)
-    procs.append(p)
+    with procs_lock:
+        procs.append(p)
+    run.procs.append(p)
     return p
 
 
@@ -87,21 +105,23 @@ def stop(p):
         except subprocess.TimeoutExpired:
             os.killpg(p.pid, signal.SIGKILL)
             p.wait()
-    procs.remove(p)
+    with procs_lock:
+        if p in procs:
+            procs.remove(p)
 
 
-def wait_for(name, needle, timeout):
+def wait_for(run, name, needle, timeout):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        with open(log_path(name)) as f:
+        with open(run.path(name + ".log")) as f:
             if needle in f.read():
                 return
         time.sleep(0.1)
     raise RuntimeError(f"{name} did not print {needle!r} within {timeout}s")
 
 
-def curl(socks, url, max_time):
-    cmd = ["ip", "netns", "exec", "hk-client", "curl", "-sS", "-o", "/dev/null", "-w", "%{time_total} %{size_download}",
+def curl(run, socks, url, max_time):
+    cmd = ["ip", "netns", "exec", run.client_ns, "curl", "-sS", "-o", "/dev/null", "-w", "%{time_total} %{size_download}",
            "--max-time", str(max_time), "--cacert", os.path.join(opts.certs, "ca.pem"), "--socks5-hostname", socks, url]
     r = subprocess.run(cmd, capture_output=True, text=True, env=ENV, timeout=max_time + 15)
     parts = r.stdout.split()
@@ -129,50 +149,50 @@ def certs():
 
 # Each system: start its server (hk-server), return a function that starts its client
 # (hk-client), and the client's SOCKS5 address.
-def hikyaku():
+def hikyaku(run):
     psk = secrets.token_urlsafe(24)
-    spawn([os.path.join(opts.hikyaku, "hikyaku-server"), "-listen", f"{SERVER}:8445", "-allow-private",
-           "-psk", psk], "hikyaku-server", "hk-server")
-    client = [os.path.join(opts.hikyaku, "hikyaku-client"), "-listen", "127.0.0.1:1080", "-server", f"{SERVER}:8445",
-              "-psk", psk, "-carriers", "4"]
-    return lambda: spawn(client, "hikyaku-client", "hk-client"), "127.0.0.1:1080"
+    spawn(run, [os.path.join(opts.hikyaku, "hikyaku-server"), "-listen", f"{run.server}:8445", "-allow-private",
+                "-psk", psk], "hikyaku-server", "server")
+    client = [os.path.join(opts.hikyaku, "hikyaku-client"), "-listen", "127.0.0.1:1080", "-server",
+              f"{run.server}:8445", "-psk", psk, "-carriers", "4"]
+    return lambda: spawn(run, client, "hikyaku-client", "client"), "127.0.0.1:1080"
 
 
-def satmux():
+def satmux(run):
     psk = secrets.token_hex(32)
-    spawn(["python3", opts.satmux, "server", "--host", SERVER, "--port", "8444"], "satmux-server", "hk-server",
+    spawn(run, ["python3", opts.satmux, "server", "--host", run.server, "--port", "8444"], "satmux-server", "server",
           {"SATMUX_PSK": psk})
-    client = ["python3", opts.satmux, "client", "--host", SERVER, "--port", "8444", "--carriers", "12",
+    client = ["python3", opts.satmux, "client", "--host", run.server, "--port", "8444", "--carriers", "12",
               "--socks-port", "1081", "--http-port", "18080", "--fast-port", "18081",
-              "--gh-sock", os.path.join(opts.out, "satmux-gh.sock")]
-    return lambda: spawn(client, "satmux-client", "hk-client", {"SATMUX_PSK": psk}), "127.0.0.1:1081"
+              "--gh-sock", run.path("gh.sock")]
+    return lambda: spawn(run, client, "satmux-client", "client", {"SATMUX_PSK": psk}), "127.0.0.1:1081"
 
 
-def tuic():
+def tuic(run):
     uuid, password = "11111111-2222-3333-4444-555555555555", secrets.token_urlsafe(24)
-    server_toml, client_toml = os.path.join(opts.out, "tuic-server.toml"), os.path.join(opts.out, "tuic-client.toml")
+    server_toml, client_toml = run.path("tuic-server.toml"), run.path("tuic-client.toml")
     with open(server_toml, "w") as f:
-        f.write(f'log_level = "info"\nserver = "{SERVER}:7444"\n[users]\n"{uuid}" = "{password}"\n'
+        f.write(f'log_level = "info"\nserver = "{run.server}:7444"\n[users]\n"{uuid}" = "{password}"\n'
                 f'[tls]\ncertificate = "{opts.certs}/leaf.pem"\nprivate_key = "{opts.certs}/leaf.key"\n'
                 f'alpn = ["h3"]\nhostname = "localhost"\n[experimental]\ndrop_loopback = false\n')
     with open(client_toml, "w") as f:
-        f.write(f'log_level = "info"\n[relay]\nserver = "localhost:7444"\nip = "{SERVER}"\nuuid = "{uuid}"\n'
+        f.write(f'log_level = "info"\n[relay]\nserver = "localhost:7444"\nip = "{run.server}"\nuuid = "{uuid}"\n'
                 f'password = "{password}"\ncertificates = ["{opts.certs}/ca.pem"]\nalpn = ["h3"]\n'
                 f'congestion_control = "bbr"\n[local]\nserver = "127.0.0.1:1082"\n')
-    spawn([os.path.join(opts.tuic, "tuic-server"), "-c", server_toml], "tuic-server", "hk-server")
+    spawn(run, [os.path.join(opts.tuic, "tuic-server"), "-c", server_toml], "tuic-server", "server")
     client = [os.path.join(opts.tuic, "tuic-client"), "-c", client_toml]
-    return lambda: spawn(client, "tuic-client", "hk-client"), "127.0.0.1:1082"
+    return lambda: spawn(run, client, "tuic-client", "client"), "127.0.0.1:1082"
 
 
 SYSTEMS = {"hikyaku": hikyaku, "satmux": satmux, "tuic": tuic}
 
 
-def measure(start_client, socks):
+def measure(run, start_client, socks, size):
     result = {}
     t0 = time.time()
     start_client()
     while True:
-        ok, _, _ = curl(socks, SMALL, 20)
+        ok, _, _ = curl(run, socks, SMALL, 20)
         if ok:
             result["cold_s"] = round(time.time() - t0, 2)
             break
@@ -183,12 +203,12 @@ def measure(start_client, socks):
 
     def burst():
         with concurrent.futures.ThreadPoolExecutor(6) as ex:
-            return list(ex.map(lambda _: curl(socks, SMALL, 30), range(6)))
+            return list(ex.map(lambda _: curl(run, socks, SMALL, 30), range(6)))
 
     burst()  # let pools that grow on demand reach their working size
     time.sleep(1)
 
-    warm = [curl(socks, SMALL, 30) for _ in range(20)]
+    warm = [curl(run, socks, SMALL, 30) for _ in range(20)]
     times = sorted(s for ok, s, _ in warm if ok)
     result["warm_median_s"] = round(statistics.median(times), 3) if times else None
     result["warm_p90_s"] = round(times[max(0, int(len(times) * 0.9) - 1)], 3) if times else None
@@ -198,19 +218,22 @@ def measure(start_client, socks):
     result["burst_max_s"] = round(max(s for ok, s, _ in b if ok), 3) if all(ok for ok, _, _ in b) else None
     result["burst_failures"] = sum(1 for ok, _, _ in b if not ok)
 
+    # Throughput is bytes over time, so a download that hits the limit still counts.
     rates = []
     for _ in range(3):
-        _, seconds, size = curl(socks, BIG, 60)
-        rates.append(size * 8 / seconds / 1e6 if seconds else 0.0)
+        _, seconds, received = curl(run, socks, BIG.format(size), BULK_LIMIT_S)
+        rates.append(received * 8 / seconds / 1e6 if seconds else 0.0)
+    result["bulk_mb"] = round(size / 1e6, 1)
     result["bulk_mbps"] = round(statistics.median(rates), 2)
     result["bulk_runs_mbps"] = [round(r, 2) for r in rates]
 
+    # Twice the timed size, so the link stays busy through the small fetches.
     background = subprocess.Popen(
-        ["ip", "netns", "exec", "hk-client", "curl", "-sS", "-o", "/dev/null", "--max-time", "60",
-         "--socks5-hostname", socks, BIG], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV,
-        start_new_session=True)
+        ["ip", "netns", "exec", run.client_ns, "curl", "-sS", "-o", "/dev/null", "--max-time", str(2 * BULK_LIMIT_S),
+         "--socks5-hostname", socks, BIG.format(2 * size)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=ENV, start_new_session=True)
     time.sleep(2)
-    loaded = [curl(socks, SMALL, 30) for _ in range(3)]
+    loaded = [curl(run, socks, SMALL, 30) for _ in range(3)]
     os.killpg(background.pid, signal.SIGTERM)
     background.wait()
     loaded_times = [s for ok, s, _ in loaded if ok]
@@ -219,8 +242,28 @@ def measure(start_client, socks):
     return result
 
 
+def execute(run, netsim_args, size):
+    try:
+        spawn(run, [opts.netsim, "-id", str(run.instance), *netsim_args], "netsim")
+        wait_for(run, "netsim", "ready", 10)
+        spawn(run, ["python3", os.path.join(HERE, "origin.py"), os.path.join(opts.certs, "leaf.pem"),
+                    os.path.join(opts.certs, "leaf.key")], "origin", "server")
+        wait_for(run, "origin", "origin ready", 10)
+        start_client, socks = SYSTEMS[run.system](run)
+        time.sleep(1)
+        result = measure(run, start_client, socks, size)
+        if run.system == "hikyaku":
+            with open(run.path("hikyaku-client.log")) as f:
+                log = f.read()
+            result["carrier_events"] = {k: log.count(v) for k, v in CARRIER_EVENTS.items()}
+        return result
+    finally:
+        for p in run.procs[::-1]:
+            stop(p)
+
+
 def table(results):
-    head = ("| Profile | System | Cold start | Warm median | Warm p90 | 6-way burst | 10 MB download "
+    head = ("| Profile | System | Cold start | Warm median | Warm p90 | 6-way burst | Download "
             "| Small fetch during download | Failures |")
     lines = [head, "|" + "---|" * 9]
     fmt = lambda v, unit="s": "fail" if v is None else f"{v} {unit}"
@@ -229,12 +272,12 @@ def table(results):
             failures = r["warm_failures"] + r["burst_failures"] + r["loaded_failures"]
             lines.append(f"| {profile} | {system} | {fmt(r['cold_s'])} | {fmt(r['warm_median_s'])} "
                          f"| {fmt(r['warm_p90_s'])} | {fmt(r['burst_max_s'])} | {r['bulk_mbps']} Mbit/s "
-                         f"| {fmt(r['loaded_median_s'])} | {failures} |")
+                         f"({r['bulk_mb']} MB) | {fmt(r['loaded_median_s'])} | {failures} |")
     return "\n".join(lines)
 
 
 def main():
-    global opts, run_prefix
+    global opts
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--netsim", default="/usr/local/bin/netsim")
     ap.add_argument("--hikyaku", default="/usr/local/bin", help="directory with hikyaku-server and hikyaku-client")
@@ -244,6 +287,7 @@ def main():
     ap.add_argument("--out", default="/tmp/netsim-out")
     ap.add_argument("--profiles", default=",".join(PROFILES))
     ap.add_argument("--systems", default=",".join(SYSTEMS))
+    ap.add_argument("--sequential", action="store_true", help="run one system at a time on every profile")
     opts = ap.parse_args()
     os.makedirs(opts.out, exist_ok=True)
     certs()
@@ -252,28 +296,20 @@ def main():
     try:
         for name in opts.profiles.split(","):
             label, netsim_args = PROFILES[name]
-            run_prefix = f"{name}-"
-            sim = spawn([opts.netsim, *netsim_args], "netsim")
-            wait_for("netsim", "ready", 10)
-            origin = spawn(["python3", os.path.join(HERE, "origin.py"), os.path.join(opts.certs, "leaf.pem"),
-                            os.path.join(opts.certs, "leaf.key")], "origin", "hk-server")
-            wait_for("origin", "origin ready", 10)
-            for system in opts.systems.split(","):
-                say(f"== {label}: {system}")
-                started = len(procs)
-                start_client, socks = SYSTEMS[system]()
-                time.sleep(1)
-                results.setdefault(label, {})[system] = measure(start_client, socks)
-                if system == "hikyaku":
-                    with open(log_path("hikyaku-client")) as f:
-                        log = f.read()
-                    results[label][system]["carrier_events"] = {k: log.count(v) for k, v in CARRIER_EVENTS.items()}
-                say(f"   {results[label][system]}")
-                for p in procs[started:][::-1]:
-                    stop(p)
-                time.sleep(1)
-            stop(origin)
-            stop(sim)
+            rate = lambda flag: float(netsim_args[netsim_args.index(flag) + 1])
+            size = int(min(max(rate("-down-rate") * 1e6 / 8 * BULK_SECONDS, 1e6), 10e6))
+            parallel = not opts.sequential and max(rate("-down-rate"), rate("-up-rate")) <= PARALLEL_MAX_MBPS
+            runs = [Run(name, system, i + 1) for i, system in enumerate(opts.systems.split(","))]
+            say(f"== {label}: {', '.join(r.system for r in runs)}{' in parallel' if parallel else ''}, "
+                f"{size / 1e6:.1f} MB downloads")
+            if parallel:
+                with concurrent.futures.ThreadPoolExecutor(len(runs)) as ex:
+                    measured = list(ex.map(lambda r: execute(r, netsim_args, size), runs))
+            else:
+                measured = [execute(r, netsim_args, size) for r in runs]
+            for r, m in zip(runs, measured):
+                results.setdefault(label, {})[r.system] = m
+                say(f"   {r.system}: {m}")
             with open(os.path.join(opts.out, "results.json"), "w") as f:
                 json.dump(results, f, indent=2)
     finally:

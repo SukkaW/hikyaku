@@ -5,10 +5,11 @@
 // outages, latency spikes and periodic pauses.
 //
 // It creates the namespaces hk-client (10.200.0.1) and hk-server (10.200.0.2), each
-// with a TUN device, and forwards every packet between them. It needs root (or
-// CAP_NET_ADMIN and CAP_SYS_ADMIN with /dev/net/tun). Processes started with
-// `ip netns exec hk-client ...` or `ip netns exec hk-server ...` use the path until
-// netsim exits, which removes both namespaces.
+// with a TUN device, and forwards every packet between them; with -id N they are
+// hk-client-N and hk-server-N on 10.200.N.0, so several paths can run at once. It
+// needs root (or CAP_NET_ADMIN and CAP_SYS_ADMIN with /dev/net/tun). Processes started
+// with `ip netns exec hk-client ...` or `ip netns exec hk-server ...` use the path
+// until netsim exits, which removes both namespaces.
 package main
 
 import (
@@ -28,15 +29,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const (
-	clientNS   = "hk-client"
-	serverNS   = "hk-server"
-	clientAddr = "10.200.0.1"
-	serverAddr = "10.200.0.2"
-	mtu        = 1500
-)
+const mtu = 1500
+
+// path names one emulated path's namespaces, devices and addresses.
+type path struct {
+	clientNS, serverNS, clientDev, serverDev, clientAddr, serverAddr string
+}
+
+func newPath(id int) path {
+	if id == 0 {
+		return path{"hk-client", "hk-server", "hkc", "hks", "10.200.0.1", "10.200.0.2"}
+	}
+	return path{
+		fmt.Sprintf("hk-client-%d", id), fmt.Sprintf("hk-server-%d", id),
+		fmt.Sprintf("hkc%d", id), fmt.Sprintf("hks%d", id),
+		fmt.Sprintf("10.200.%d.1", id), fmt.Sprintf("10.200.%d.2", id),
+	}
+}
 
 func main() {
+	id := flag.Int("id", 0, "instance number from 0 to 255; each gets its own namespaces and addresses")
 	rtt := flag.Duration("rtt", 620*time.Millisecond, "round-trip delay, split evenly between the two directions")
 	loss := flag.Float64("loss", 0, "round-trip packet loss in percent, spread over both directions")
 	downRate := flag.Float64("down-rate", 0, "bandwidth cap in Mbit/s from server to client (0: none)")
@@ -53,6 +65,10 @@ func main() {
 	pauseUp := flag.Duration("pause-up", 0, "pause length from client to server")
 	seed := flag.Uint64("seed", 1, "seed for the loss, outage and spike patterns")
 	flag.Parse()
+	if *id < 0 || *id > 255 {
+		log.Fatalf("-id %d is outside 0-255", *id)
+	}
+	p := newPath(*id)
 
 	// Losing L of round trips means each direction drops p, where (1-p)^2 = 1-L.
 	perDirection := 1 - math.Sqrt(1-*loss/100)
@@ -80,16 +96,16 @@ func main() {
 		}
 	}
 
-	if err := setup(); err != nil {
-		teardown()
+	if err := setup(p); err != nil {
+		teardown(p)
 		log.Fatal(err)
 	}
-	clientTUN, err := openTUN(clientNS, "hkc")
+	clientTUN, err := openTUN(p.clientNS, p.clientDev)
 	if err == nil {
 		var serverTUN *os.File
-		if serverTUN, err = openTUN(serverNS, "hks"); err == nil {
-			if err = configure(clientNS, "hkc", clientAddr, serverAddr); err == nil {
-				err = configure(serverNS, "hks", serverAddr, clientAddr)
+		if serverTUN, err = openTUN(p.serverNS, p.serverDev); err == nil {
+			if err = configure(p.clientNS, p.clientDev, p.clientAddr, p.serverAddr); err == nil {
+				err = configure(p.serverNS, p.serverDev, p.serverAddr, p.clientAddr)
 			}
 			if err == nil {
 				go link(1, *upRate, *pauseUp).forward(clientTUN, serverTUN)
@@ -98,7 +114,7 @@ func main() {
 		}
 	}
 	if err != nil {
-		teardown()
+		teardown(p)
 		log.Fatal(err)
 	}
 	fmt.Printf("netsim: rtt %s, %.4f%% loss per round trip (%.4f%% each way), down %s, up %s, %s queue",
@@ -117,7 +133,7 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	teardown()
+	teardown(p)
 }
 
 func rateString(mbps float64) string {
@@ -134,9 +150,9 @@ func run(args ...string) error {
 	return nil
 }
 
-func setup() error {
-	teardown()
-	for _, ns := range []string{clientNS, serverNS} {
+func setup(p path) error {
+	teardown(p)
+	for _, ns := range []string{p.clientNS, p.serverNS} {
 		if err := run("netns", "add", ns); err != nil {
 			return err
 		}
@@ -147,8 +163,8 @@ func setup() error {
 	return nil
 }
 
-func teardown() {
-	for _, ns := range []string{clientNS, serverNS} {
+func teardown(p path) {
+	for _, ns := range []string{p.clientNS, p.serverNS} {
 		exec.Command("ip", "netns", "del", ns).Run()
 	}
 }
