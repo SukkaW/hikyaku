@@ -67,6 +67,39 @@ func TestPoolWarmBurst(t *testing.T) {
 	wg.Wait()
 }
 
+func TestPoolWakesWaiters(t *testing.T) {
+	psk := "wake-waiters-test"
+	p := newPool(startServer(t, psk), []byte(psk), 1)
+	p.opened = 1 // the test supplies the carrier itself, so it decides when one appears
+	done := make(chan error, 1)
+	go func() {
+		_, s, err := p.openStream()
+		if err == nil {
+			s.Close()
+		}
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	c, err := p.dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.session.Close()
+	appeared := time.Now()
+	p.set(0, c)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waited := time.Since(appeared); waited >= healthCheck/2 {
+			t.Fatalf("waiter woke %s after the carrier appeared, so it relied on the %s fallback", waited, healthCheck)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter never woke")
+	}
+}
+
 func (p *pool) acked() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()

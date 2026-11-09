@@ -57,11 +57,12 @@ type pool struct {
 	carriers []*carrier
 	standby  []*carrier
 	opened   int
+	changed  chan struct{} // closed and replaced whenever a carrier becomes usable
 	probing  atomic.Bool
 }
 
 func newPool(server string, psk []byte, carriers int) *pool {
-	return &pool{server: server, psk: psk, carriers: make([]*carrier, carriers)}
+	return &pool{server: server, psk: psk, carriers: make([]*carrier, carriers), changed: make(chan struct{})}
 }
 
 // warm opens the first carrier before any request, so one that arrives a round trip
@@ -131,7 +132,16 @@ func (p *pool) maintain(slot int) {
 func (p *pool) set(slot int, c *carrier) {
 	p.mu.Lock()
 	p.carriers[slot] = c
+	if c != nil {
+		p.wake()
+	}
 	p.mu.Unlock()
+}
+
+// wake releases requests waiting for a carrier; the caller holds p.mu.
+func (p *pool) wake() {
+	close(p.changed)
+	p.changed = make(chan struct{})
 }
 
 func (p *pool) toStandby(c *carrier) {
@@ -338,6 +348,7 @@ func (p *pool) probeOutage() {
 			}
 			p.mu.Lock()
 			p.standby = append(p.standby, c)
+			p.wake()
 			p.mu.Unlock()
 			log.Printf("link: probe acknowledged, outage over")
 			go p.retire(c)
@@ -375,8 +386,13 @@ func (p *pool) retire(c *carrier) {
 // openStream waits for a usable carrier when none is ready yet, such as right
 // after start or an outage, so the stream rides the new carrier's first flight.
 func (p *pool) openStream() (*carrier, *carrierStream, error) {
-	deadline := time.Now().Add(carrierWait)
+	deadline := time.NewTimer(carrierWait)
+	defer deadline.Stop()
 	for {
+		// Taken before pick, so a carrier that appears in between still wakes us.
+		p.mu.Lock()
+		changed := p.changed
+		p.mu.Unlock()
 		if c := p.pick(); c != nil {
 			s, err := c.session.OpenStream()
 			if err != nil {
@@ -384,10 +400,13 @@ func (p *pool) openStream() (*carrier, *carrierStream, error) {
 			}
 			return c, c.newStream(s), nil
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-changed:
+		// A standby carrier that starts receiving again raises no signal.
+		case <-time.After(healthCheck):
+		case <-deadline.C:
 			return nil, nil, errNoCarrier
 		}
-		time.Sleep(carrierPoll)
 	}
 }
 
