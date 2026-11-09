@@ -19,7 +19,7 @@ import (
 	"github.com/things-go/go-socks5/statute"
 )
 
-func startServer(t *testing.T, psk string) string {
+func startServer(t testing.TB, psk string) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "hikyaku-server")
 	if out, err := exec.Command("go", "build", "-o", bin, "github.com/SukkaW/hikyaku/cmd/hikyaku-server").CombinedOutput(); err != nil {
@@ -56,7 +56,7 @@ func startServer(t *testing.T, psk string) string {
 	}
 }
 
-func startClient(t *testing.T, server string, psk []byte) socksClient {
+func startClient(t testing.TB, server string, psk []byte) socksClient {
 	t.Helper()
 	p := newPool(server, psk, 2)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

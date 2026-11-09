@@ -13,7 +13,7 @@ import (
 	"github.com/xtaci/smux"
 )
 
-func openStream(t *testing.T, allowPrivate bool, destination statute.AddrSpec) *smux.Stream {
+func openStream(t testing.TB, allowPrivate bool, destination statute.AddrSpec) *smux.Stream {
 	t.Helper()
 	psk := make([]byte, proxy.PSKSize)
 	rand.Read(psk)
@@ -47,7 +47,7 @@ func openStream(t *testing.T, allowPrivate bool, destination statute.AddrSpec) *
 	return stream
 }
 
-func addrOf(t *testing.T, addr net.Addr) statute.AddrSpec {
+func addrOf(t testing.TB, addr net.Addr) statute.AddrSpec {
 	t.Helper()
 	spec, err := statute.ParseAddrSpec(addr.String())
 	if err != nil {
@@ -108,7 +108,7 @@ func TestTCPTarget(t *testing.T) {
 	})
 }
 
-func readPong(t *testing.T, stream io.Reader) {
+func readPong(t testing.TB, stream io.Reader) {
 	t.Helper()
 	var p [1]byte
 	if _, err := io.ReadFull(stream, p[:]); err != nil || p[0] != proxy.Pong {
