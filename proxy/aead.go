@@ -28,6 +28,10 @@ const (
 
 	replayGeneration     = 12 * time.Hour
 	replayGenerationSize = 100_000
+
+	// controlFlag marks a chunk as a carrier control message rather than smux data;
+	// chunks are at most maxChunk long, so the length's top bit is free.
+	controlFlag = 0x8000
 )
 
 var ErrReplay = errors.New("replayed handshake")
@@ -66,7 +70,8 @@ func (f *ReplayFilter) firstSeen(salt []byte, now time.Time) bool {
 
 // Conn encrypts a carrier with AES-256-GCM in length-prefixed chunks. Each Write
 // becomes as few chunks as possible, so a smux frame never straddles two chunks.
-// Reads and Writes are each expected from one goroutine at a time, as smux does.
+// Reads are expected from one goroutine at a time, as smux does; writes are
+// serialized, so control messages can go out while smux writes.
 type Conn struct {
 	net.Conn
 	r *bufio.Reader
@@ -76,6 +81,7 @@ type Conn struct {
 	rbuf      []byte
 	pending   []byte
 
+	wmu       sync.Mutex
 	seal      cipher.AEAD
 	sealNonce [12]byte
 	wbuf      []byte
@@ -84,9 +90,10 @@ type Conn struct {
 	clientSalt []byte
 	acked      atomic.Bool
 
+	control  func(cmd byte, body []byte)
 	lastRead atomic.Int64 // unix nanoseconds of the last authenticated chunk
+	lastData atomic.Int64 // unix nanoseconds of the last chunk carrying smux data
 	readErr  atomic.Pointer[error]
-	beats    heartbeat
 }
 
 // ClientHandshake sends the client salt and hello and returns at once, so streams
@@ -101,7 +108,7 @@ func ClientHandshake(conn net.Conn, psk []byte) (*Conn, error) {
 	if c.seal, err = newAEAD(psk, c.clientSalt, "hikyaku c2s"); err != nil {
 		return nil, err
 	}
-	if err := c.writeWithPrefix(c.clientSalt, []byte{helloVersion}); err != nil {
+	if err := c.writeWithPrefix(c.clientSalt, []byte{helloVersion}, 0); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -136,7 +143,7 @@ func ServerHandshake(conn net.Conn, psk []byte, replay *ReplayFilter) (*Conn, er
 	if c.seal, err = newAEAD(psk, append(serverSalt, clientSalt...), "hikyaku s2c"); err != nil {
 		return nil, err
 	}
-	if err := c.writeWithPrefix(serverSalt, []byte{version}); err != nil {
+	if err := c.writeWithPrefix(serverSalt, []byte{version}, 0); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -146,6 +153,7 @@ func newConn(conn net.Conn) *Conn {
 	c := &Conn{Conn: conn, r: bufio.NewReaderSize(conn, 64<<10)}
 	// Counting from creation makes a carrier that never hears back look silent.
 	c.lastRead.Store(time.Now().UnixNano())
+	c.lastData.Store(c.lastRead.Load())
 	return c
 }
 
@@ -166,15 +174,29 @@ func (c *Conn) LastRead() time.Time {
 	return time.Unix(0, c.lastRead.Load())
 }
 
+// LastData reports when the peer's most recent smux data arrived; control messages
+// do not count.
+func (c *Conn) LastData() time.Time {
+	return time.Unix(0, c.lastData.Load())
+}
+
 // Acked reports whether the server has acknowledged a client handshake.
 func (c *Conn) Acked() bool {
 	return c.acked.Load()
 }
 
-// HeartbeatLag estimates queueing on the path from the peer: how late its latest
-// keepalive arrived relative to the earliest ones' schedule.
-func (c *Conn) HeartbeatLag() time.Duration {
-	return c.beats.current()
+// OnControl sets the handler for the peer's control messages; set it before smux
+// starts reading. It runs on the reading goroutine, so it must not block, and body
+// is only valid during the call.
+func (c *Conn) OnControl(handle func(cmd byte, body []byte)) {
+	c.control = handle
+}
+
+// WriteControl sends a control message, which smux on the other side never sees.
+func (c *Conn) WriteControl(cmd byte, body []byte) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return c.writeWithPrefix(nil, append([]byte{cmd}, body...), controlFlag)
 }
 
 // ReadErr returns the first error the carrier hit while reading, if any.
@@ -238,18 +260,20 @@ func (c *Conn) awaitAck() error {
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
-	if err := c.writeWithPrefix(nil, b); err != nil {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if err := c.writeWithPrefix(nil, b, 0); err != nil {
 		return 0, err
 	}
 	return len(b), nil
 }
 
-func (c *Conn) writeWithPrefix(prefix, b []byte) error {
+func (c *Conn) writeWithPrefix(prefix, b []byte, flag uint16) error {
 	c.wbuf = append(c.wbuf[:0], prefix...)
 	for len(b) > 0 {
 		n := min(len(b), maxChunk)
 		var length [2]byte
-		binary.BigEndian.PutUint16(length[:], uint16(n))
+		binary.BigEndian.PutUint16(length[:], uint16(n)|flag)
 		c.wbuf = c.seal.Seal(c.wbuf, c.sealNonce[:], length[:], nil)
 		increment(&c.sealNonce)
 		c.wbuf = c.seal.Seal(c.wbuf, c.sealNonce[:], b[:n], nil)
@@ -260,38 +284,48 @@ func (c *Conn) writeWithPrefix(prefix, b []byte) error {
 	return err
 }
 
+// readChunk returns the next chunk of smux data, handing control messages that
+// arrive before it to the control handler.
 func (c *Conn) readChunk() ([]byte, error) {
 	overhead := c.open.Overhead()
 	if cap(c.rbuf) < maxChunk+overhead {
 		c.rbuf = make([]byte, maxChunk+overhead)
 	}
-	header := c.rbuf[:2+overhead]
-	if _, err := io.ReadFull(c.r, header); err != nil {
-		return nil, err
+	for {
+		header := c.rbuf[:2+overhead]
+		if _, err := io.ReadFull(c.r, header); err != nil {
+			return nil, err
+		}
+		length, err := c.open.Open(header[:0], c.openNonce[:], header, nil)
+		if err != nil {
+			return nil, err
+		}
+		increment(&c.openNonce)
+		n := int(binary.BigEndian.Uint16(length))
+		control := n&controlFlag != 0
+		n &^= controlFlag
+		if n == 0 || n > maxChunk {
+			return nil, fmt.Errorf("invalid chunk length %d", n)
+		}
+		payload := c.rbuf[:n+overhead]
+		if _, err := io.ReadFull(c.r, payload); err != nil {
+			return nil, err
+		}
+		plain, err := c.open.Open(payload[:0], c.openNonce[:], payload, nil)
+		if err != nil {
+			return nil, err
+		}
+		increment(&c.openNonce)
+		now := time.Now().UnixNano()
+		c.lastRead.Store(now)
+		if !control {
+			c.lastData.Store(now)
+			return plain, nil
+		}
+		if c.control != nil {
+			c.control(plain[0], plain[1:])
+		}
 	}
-	length, err := c.open.Open(header[:0], c.openNonce[:], header, nil)
-	if err != nil {
-		return nil, err
-	}
-	increment(&c.openNonce)
-	n := int(binary.BigEndian.Uint16(length))
-	if n == 0 || n > maxChunk {
-		return nil, fmt.Errorf("invalid chunk length %d", n)
-	}
-	payload := c.rbuf[:n+overhead]
-	if _, err := io.ReadFull(c.r, payload); err != nil {
-		return nil, err
-	}
-	plain, err := c.open.Open(payload[:0], c.openNonce[:], payload, nil)
-	if err != nil {
-		return nil, err
-	}
-	increment(&c.openNonce)
-	c.lastRead.Store(time.Now().UnixNano())
-	if len(plain) == 8 && plain[1] == smuxNOP {
-		c.beats.observe(time.Now())
-	}
-	return plain, nil
 }
 
 func increment(nonce *[12]byte) {

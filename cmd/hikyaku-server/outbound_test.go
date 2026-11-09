@@ -17,6 +17,21 @@ import (
 
 func openStream(t testing.TB, allowPrivate bool, request []byte) *smux.Stream {
 	t.Helper()
+	_, session := startCarrier(t, allowPrivate, nil)
+	stream, err := session.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	return stream
+}
+
+// startCarrier starts a server and opens one carrier to it; onControl, if set,
+// receives the server's control messages.
+func startCarrier(t testing.TB, allowPrivate bool, onControl func(cmd byte, body []byte)) (*proxy.Conn, *smux.Session) {
+	t.Helper()
 	psk := make([]byte, proxy.PSKSize)
 	rand.Read(psk)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -34,19 +49,15 @@ func openStream(t testing.TB, allowPrivate bool, request []byte) *smux.Stream {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if onControl != nil {
+		c.OnControl(onControl)
+	}
 	session, err := smux.Client(c, proxy.MuxConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { session.Close() })
-	stream, err := session.OpenStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := stream.Write(request); err != nil {
-		t.Fatal(err)
-	}
-	return stream
+	return c, session
 }
 
 func addrOf(t testing.TB, addr net.Addr) proxy.Addr {

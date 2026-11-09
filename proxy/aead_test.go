@@ -143,7 +143,7 @@ func clientWithHello(conn net.Conn, psk, hello []byte) (*Conn, error) {
 	if c.seal, err = newAEAD(psk, c.clientSalt, "hikyaku c2s"); err != nil {
 		return nil, err
 	}
-	return c, c.writeWithPrefix(c.clientSalt, hello)
+	return c, c.writeWithPrefix(c.clientSalt, hello, 0)
 }
 
 func TestHelloVersion(t *testing.T) {
@@ -267,4 +267,45 @@ func TestZeroRTT(t *testing.T) {
 			t.Fatal("acknowledged with a different PSK")
 		}
 	})
+}
+
+func TestControlMessages(t *testing.T) {
+	psk := newPSK()
+	clientRaw, serverRaw := tcpPair(t)
+	result := serve(serverRaw, psk, NewReplayFilter())
+	client, err := ClientHandshake(clientRaw, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := <-result
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	server := r.conn
+	type message struct {
+		cmd  byte
+		body string
+	}
+	atServer, atClient := make(chan message, 1), make(chan message, 1)
+	server.OnControl(func(cmd byte, body []byte) { atServer <- message{cmd, string(body)} })
+	client.OnControl(func(cmd byte, body []byte) { atClient <- message{cmd, string(body)} })
+
+	// Each side sends data, a control message, then more data; reads see only the data.
+	exchange := func(from, to *Conn, cmd byte, got <-chan message) {
+		t.Helper()
+		go func() {
+			from.Write([]byte("ab"))
+			from.WriteControl(cmd, []byte("id"))
+			from.Write([]byte("cd"))
+		}()
+		data := make([]byte, 4)
+		if _, err := io.ReadFull(to, data); err != nil || string(data) != "abcd" {
+			t.Fatalf("read %q, %v; want only the data", data, err)
+		}
+		if m := <-got; m != (message{cmd, "id"}) {
+			t.Fatalf("control handler got %+v", m)
+		}
+	}
+	exchange(client, server, CtrlPing, atServer)
+	exchange(server, client, CtrlPong, atClient)
 }

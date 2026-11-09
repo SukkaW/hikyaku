@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"log"
 	"net"
@@ -22,11 +23,23 @@ const (
 	carrierWait  = 10 * time.Second
 	carrierPoll  = 50 * time.Millisecond
 	ackTimeout   = 3 * time.Second
+	pongTimeout  = 3 * time.Second
 	slowMargin   = time.Second
 	slowStrikes  = 3
+	slowEvery    = 2 * time.Second
 	metricsEvery = 30 * time.Second
-	outageAfter  = 3 * time.Second
 	probeWait    = 5 * time.Second
+	// Pings go out only when a carrier is quiet: often while it was in use recently,
+	// which keeps the server's congestion window from shrinking during reading
+	// pauses, and rarely once idle. A busy carrier still gets one now and then, so its
+	// round trip stays measured under load.
+	quietAfter = 500 * time.Millisecond
+	warmFor    = 30 * time.Second
+	warmPing   = 500 * time.Millisecond
+	coldPing   = 15 * time.Second
+	busyPing   = 5 * time.Second
+	// deadAfter closes a standby carrier whose ping has gone unanswered this long.
+	deadAfter = 30 * time.Second
 )
 
 var errNoCarrier = errors.New("no carrier is ready")
@@ -36,11 +49,17 @@ type carrier struct {
 	session *smux.Session
 	conn    *proxy.Conn
 	ready   time.Time
-	rtt     atomic.Int64 // smoothed acknowledgement round trip in nanoseconds; 0 until the first one
+	rtt     atomic.Int64 // smoothed round trip from pongs and acknowledgements in nanoseconds; 0 until the first
+
+	lastStream atomic.Int64           // unix nanoseconds when a stream last closed
+	goaway     atomic.Pointer[string] // the server's reason, once it sent GOAWAY
+	pingNow    chan struct{}
 
 	mu         sync.Mutex
 	unanswered map[*replayStream]struct{}
 	waiting    map[*carrierStream]time.Time // streams still waiting for their acknowledgement
+	pings      map[uint32]time.Time         // pings still waiting for their pong
+	nextPing   uint32
 }
 
 // pool opens carriers on demand, up to a fixed number of slots; an opened slot is
@@ -97,10 +116,15 @@ func (p *pool) maintain(slot int) {
 		v := p.watch(c)
 		silent := v == silent || v == noAck
 		switch {
+		case v == goingAway:
+			// The server keeps serving the carrier's streams, so they stay where they are.
+			p.toStandby(c)
+			log.Printf("carrier %d: %s after %s, standing by", slot, *c.goaway.Load(), c.lifetime())
+			go p.retire(c)
 		case v == slow:
 			p.toStandby(c)
 			c.moveUnanswered()
-			log.Printf("carrier %d: %s slower than the best other carrier for %d heartbeats after %s, standing by",
+			log.Printf("carrier %d: %s slower than the best other carrier for %d checks after %s, standing by",
 				slot, slowMargin, slowStrikes, c.lifetime())
 			go p.retire(c)
 		case silent && c.conn.Acked():
@@ -109,7 +133,7 @@ func (p *pool) maintain(slot int) {
 			if v == noAck {
 				log.Printf("carrier %d: acknowledgement overdue by %s after %s, standing by", slot, ackTimeout, c.lifetime())
 			} else {
-				log.Printf("carrier %d: silent for %s after %s, standing by", slot, suspectAfter, c.lifetime())
+				log.Printf("carrier %d: silent for %s after %s, standing by", slot, pongTimeout, c.lifetime())
 			}
 			go p.retire(c)
 		case silent:
@@ -159,34 +183,113 @@ func (p *pool) dial() (*carrier, error) {
 	if err != nil {
 		return nil, err
 	}
-	c, err := proxy.ClientHandshake(conn, p.psk)
+	pc, err := proxy.ClientHandshake(conn, p.psk)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	session, err := smux.Client(c, proxy.MuxConfig())
+	c := &carrier{conn: pc, pings: make(map[uint32]time.Time), pingNow: make(chan struct{}, 1)}
+	pc.OnControl(c.control)
+	session, err := smux.Client(pc, proxy.MuxConfig())
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	return &carrier{session: session, conn: c, ready: time.Now()}, nil
+	c.session, c.ready = session, time.Now()
+	go c.sendPings()
+	return c, nil
 }
 
 func (c *carrier) lifetime() time.Duration {
 	return time.Since(c.ready).Round(time.Second)
 }
 
-// closeReason explains why the session ended. smux closes the connection itself
-// on keepalive timeout, which reaches the reader as net.ErrClosed.
+// closeReason explains why the session ended; one the pool closed itself reaches
+// the reader as net.ErrClosed.
 func (c *carrier) closeReason() string {
 	if err := c.conn.ReadErr(); err != nil && !errors.Is(err, net.ErrClosed) {
 		return err.Error()
 	}
-	return "keepalive timeout"
+	return "closed"
 }
 
-func (c *carrier) silent() bool {
-	return time.Since(c.conn.LastRead()) >= suspectAfter
+// control handles the server's control messages on the carrier's reading goroutine.
+func (c *carrier) control(cmd byte, body []byte) {
+	switch cmd {
+	case proxy.CtrlPong:
+		if len(body) != 4 {
+			return
+		}
+		id := binary.BigEndian.Uint32(body)
+		c.mu.Lock()
+		sent, ok := c.pings[id]
+		delete(c.pings, id)
+		c.mu.Unlock()
+		if ok {
+			c.sample(time.Since(sent))
+		}
+	case proxy.CtrlGoAway:
+		reason := "server going away"
+		if len(body) >= 2 && len(body) >= 2+int(body[1]) {
+			reason = string(body[2 : 2+int(body[1])])
+		}
+		c.goaway.Store(&reason)
+	}
+}
+
+// sendPings writes the pings asked for on pingNow. It runs apart from the health
+// checks, so a carrier whose writes are stuck cannot stall them: its ping is
+// recorded before the write and simply goes overdue.
+func (c *carrier) sendPings() {
+	for {
+		select {
+		case <-c.pingNow:
+			c.mu.Lock()
+			id := c.nextPing
+			c.nextPing++
+			c.pings[id] = time.Now()
+			c.mu.Unlock()
+			var body [4]byte
+			binary.BigEndian.PutUint32(body[:], id)
+			if c.conn.WriteControl(proxy.CtrlPing, body[:]) != nil {
+				return
+			}
+		case <-c.session.CloseChan():
+			return
+		}
+	}
+}
+
+func (c *carrier) ping() {
+	select {
+	case c.pingNow <- struct{}{}:
+	default:
+	}
+}
+
+// pingInterval picks how often to ping a carrier from how long ago its last smux
+// data arrived, how long ago its last stream closed, and how many it has open.
+func pingInterval(sinceData, sinceStream time.Duration, streams int) time.Duration {
+	switch {
+	case sinceData < quietAfter:
+		return busyPing
+	case streams > 0 || sinceStream < warmFor:
+		return warmPing
+	default:
+		return coldPing
+	}
+}
+
+// pongOverdue reports whether a ping has waited at least d for its pong.
+func (c *carrier) pongOverdue(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, sent := range c.pings {
+		if time.Since(sent) >= d {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *carrier) ackOverdue() bool {
@@ -207,21 +310,38 @@ const (
 	silent
 	noAck
 	slow
+	goingAway
 )
 
-// watch reports why a carrier should leave its slot: its session closed, it went
-// silent, a stream's acknowledgement is overdue, or it stayed clearly slower than the
-// best other carrier for slowStrikes heartbeats in a row.
+// watch pings the carrier and reports why it should leave its slot: its session
+// closed, the server is going away, a ping went unanswered, a stream's
+// acknowledgement is overdue, or it stayed clearly slower than the best other carrier
+// for slowStrikes checks in a row.
 func (p *pool) watch(c *carrier) verdict {
 	tick := time.NewTicker(healthCheck)
 	defer tick.Stop()
 	var strikes int
-	lastBeat, lastLog := time.Now(), time.Now()
+	var lastPing time.Time
+	lastSlowCheck, lastLog := time.Now(), time.Now()
 	for {
 		select {
 		case <-c.session.CloseChan():
 			return closed
 		case <-tick.C:
+			now := time.Now()
+			// smux reports a dead connection to its streams but leaves the session open.
+			if c.conn.ReadErr() != nil {
+				c.session.Close()
+				return closed
+			}
+			if c.goaway.Load() != nil {
+				return goingAway
+			}
+			sinceStream := now.Sub(time.Unix(0, c.lastStream.Load()))
+			if now.Sub(lastPing) >= pingInterval(now.Sub(c.conn.LastData()), sinceStream, c.session.NumStreams()) {
+				lastPing = now
+				c.ping()
+			}
 			quiet := p.linkQuiet()
 			if quiet {
 				p.probeOutage()
@@ -229,7 +349,10 @@ func (p *pool) watch(c *carrier) verdict {
 			// A link-wide outage looks the same on every carrier, so while it lasts only
 			// acknowledged carriers go to standby, keeping their streams; new carriers
 			// keep waiting for their acknowledgement and the other rules wait too.
-			if c.silent() && (c.conn.Acked() || !quiet) {
+			if c.conn.Acked() && c.pongOverdue(pongTimeout) {
+				return silent
+			}
+			if !c.conn.Acked() && !quiet && now.Sub(c.ready) >= suspectAfter {
 				return silent
 			}
 			if quiet {
@@ -239,8 +362,8 @@ func (p *pool) watch(c *carrier) verdict {
 			if c.ackOverdue() {
 				return noAck
 			}
-			if time.Since(lastBeat) >= proxy.KeepAliveInterval {
-				lastBeat = time.Now()
+			if now.Sub(lastSlowCheck) >= slowEvery {
+				lastSlowCheck = now
 				if p.slower(c) {
 					strikes++
 				} else {
@@ -250,57 +373,38 @@ func (p *pool) watch(c *carrier) verdict {
 					return slow
 				}
 			}
-			if time.Since(lastLog) >= metricsEvery {
-				lastLog = time.Now()
-				log.Printf("carrier %d: rtt %s, heartbeat lag %s, %d streams",
-					c.slot, time.Duration(c.rtt.Load()).Round(time.Millisecond),
-					c.conn.HeartbeatLag().Round(time.Millisecond), c.session.NumStreams())
+			if now.Sub(lastLog) >= metricsEvery {
+				lastLog = now
+				log.Printf("carrier %d: rtt %s, %d streams",
+					c.slot, time.Duration(c.rtt.Load()).Round(time.Millisecond), c.session.NumStreams())
 			}
 		}
 	}
 }
 
-// slower reports whether c's delay exceeds the best other acknowledged carrier's by
-// slowMargin. Delay is the larger of the heartbeat lag and how far the carrier's
-// acknowledgement round trip sits above the fastest one; with no other carrier,
-// nothing is slow.
+// slower reports whether c's round trip exceeds the best other acknowledged
+// carrier's by slowMargin; with no other carrier, or no samples yet, nothing is slow.
 func (p *pool) slower(c *carrier) bool {
-	if !c.conn.Acked() {
+	rtt := time.Duration(c.rtt.Load())
+	if !c.conn.Acked() || rtt == 0 {
 		return false
 	}
 	p.mu.Lock()
-	var others []*carrier
+	var best time.Duration
 	for _, o := range p.carriers {
-		if o != nil && o != c && o.conn.Acked() && !o.session.IsClosed() {
-			others = append(others, o)
+		if o == nil || o == c || !o.conn.Acked() || o.session.IsClosed() {
+			continue
+		}
+		if r := time.Duration(o.rtt.Load()); r != 0 && (best == 0 || r < best) {
+			best = r
 		}
 	}
 	p.mu.Unlock()
-	if len(others) == 0 {
-		return false
-	}
-	fastest := time.Duration(c.rtt.Load())
-	for _, o := range others {
-		if rtt := time.Duration(o.rtt.Load()); rtt != 0 && (fastest == 0 || rtt < fastest) {
-			fastest = rtt
-		}
-	}
-	delay := func(x *carrier) time.Duration {
-		d := x.conn.HeartbeatLag()
-		if rtt := time.Duration(x.rtt.Load()); rtt != 0 {
-			d = max(d, rtt-fastest)
-		}
-		return d
-	}
-	best := delay(others[0])
-	for _, o := range others[1:] {
-		best = min(best, delay(o))
-	}
-	return delay(c)-best >= slowMargin
+	return best != 0 && rtt-best >= slowMargin
 }
 
 // linkQuiet reports a link-wide outage: some carriers have been acknowledged, yet
-// none of them has received anything for outageAfter. A carrier that was never
+// every one of them has a ping unanswered for pongTimeout. A carrier that was never
 // acknowledged has heard nothing real, so it counts neither way.
 func (p *pool) linkQuiet() bool {
 	p.mu.Lock()
@@ -310,7 +414,7 @@ func (p *pool) linkQuiet() bool {
 		if c == nil || !c.conn.Acked() || c.session.IsClosed() {
 			continue
 		}
-		if time.Since(c.conn.LastRead()) < outageAfter {
+		if !c.pongOverdue(pongTimeout) {
 			return false
 		}
 		seen = true
@@ -328,7 +432,7 @@ func (p *pool) probeOutage() {
 	}
 	go func() {
 		defer p.probing.Store(false)
-		log.Printf("link: nothing received for %s, probing", outageAfter)
+		log.Printf("link: no carrier answered a ping within %s, probing", pongTimeout)
 		for p.linkQuiet() {
 			c, err := p.dial()
 			if err != nil {
@@ -355,8 +459,9 @@ func (p *pool) probeOutage() {
 }
 
 // retire keeps a standby carrier for its existing streams, which survive a short
-// outage, and closes it once its slot is replaced and those streams are done; if
-// the server never returns, smux's keepalive timeout closes it instead.
+// outage, and closes it once its slot is replaced and those streams are done. It
+// keeps pinging, so a recovery or an outage still shows; if the server never
+// returns, it closes once a ping has gone unanswered for deadAfter.
 func (p *pool) retire(c *carrier) {
 	tick := time.NewTicker(healthCheck)
 	defer tick.Stop()
@@ -371,11 +476,21 @@ func (p *pool) retire(c *carrier) {
 			log.Printf("carrier %d: standby closed after %s: %s", c.slot, c.lifetime(), c.closeReason())
 			return
 		case <-tick.C:
+			if c.conn.ReadErr() != nil {
+				c.session.Close()
+				continue
+			}
 			if c.session.NumStreams() == 0 && p.replaced(c.slot) {
 				c.session.Close()
 				log.Printf("carrier %d: standby retired after %s", c.slot, c.lifetime())
 				return
 			}
+			if c.pongOverdue(deadAfter) {
+				c.session.Close()
+				log.Printf("carrier %d: standby closed after %s: no pong for %s", c.slot, c.lifetime(), deadAfter)
+				return
+			}
+			c.ping()
 		}
 	}
 }
@@ -421,9 +536,12 @@ func (p *pool) pick() *carrier {
 		p.grow()
 	}
 	if best == nil {
-		// A standby carrier takes new streams only once it is receiving again; that
-		// proves more than a new carrier still waiting for its acknowledgement.
-		best = fewestStreams(p.standby, func(c *carrier) bool { return !c.silent() })
+		// A standby carrier takes new streams only once its pings are answered again;
+		// that proves more than a new carrier still waiting for its acknowledgement. One
+		// the server is closing never does.
+		best = fewestStreams(p.standby, func(c *carrier) bool {
+			return !c.pongOverdue(pongTimeout) && c.goaway.Load() == nil
+		})
 	}
 	if best == nil {
 		best = fewestStreams(p.carriers, nil)
@@ -503,6 +621,7 @@ func (s *carrierStream) Close() error {
 	s.c.mu.Lock()
 	delete(s.c.waiting, s)
 	s.c.mu.Unlock()
+	s.c.lastStream.Store(time.Now().UnixNano())
 	return s.Stream.Close()
 }
 
@@ -510,6 +629,10 @@ func (c *carrier) acknowledged(s *carrierStream, rtt time.Duration) {
 	c.mu.Lock()
 	delete(c.waiting, s)
 	c.mu.Unlock()
+	c.sample(rtt)
+}
+
+func (c *carrier) sample(rtt time.Duration) {
 	if old := c.rtt.Load(); old != 0 {
 		rtt = time.Duration(old) + (rtt-time.Duration(old))/4
 	}

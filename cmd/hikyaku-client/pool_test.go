@@ -1,9 +1,13 @@
 package main
 
 import (
+	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/SukkaW/hikyaku/proxy"
+	"github.com/xtaci/smux"
 )
 
 func TestPoolKeepsSpare(t *testing.T) {
@@ -110,6 +114,88 @@ func (p *pool) acked() int {
 		}
 	}
 	return n
+}
+
+func TestPingInterval(t *testing.T) {
+	cases := []struct {
+		name                   string
+		sinceData, sinceStream time.Duration
+		streams                int
+		want                   time.Duration
+	}{
+		{"data flowing", 0, time.Hour, 1, busyPing},
+		{"quiet with a stream open", time.Second, time.Hour, 1, warmPing},
+		{"quiet soon after a stream closed", time.Second, 10 * time.Second, 0, warmPing},
+		{"idle", time.Minute, time.Minute, 0, coldPing},
+	}
+	for _, c := range cases {
+		if got := pingInterval(c.sinceData, c.sinceStream, c.streams); got != c.want {
+			t.Errorf("%s: %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+// fakeServer accepts carriers and runs smux on them like the real server, but answers
+// no pings; onCarrier runs for each one.
+func fakeServer(t *testing.T, psk string, onCarrier func(*proxy.Conn)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { conn.Close() })
+			go func() {
+				c, err := proxy.ServerHandshake(conn, []byte(psk), proxy.NewReplayFilter())
+				if err != nil {
+					return
+				}
+				if _, err := smux.Server(c, proxy.MuxConfig()); err != nil {
+					return
+				}
+				onCarrier(c)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func (p *pool) standing() []*carrier {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*carrier(nil), p.standby...)
+}
+
+func TestUnansweredPingStandsBy(t *testing.T) {
+	psk := "unanswered-ping-test"
+	p := newPool(fakeServer(t, psk, func(*proxy.Conn) {}), []byte(psk), 1)
+	p.warm()
+	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
+	deadline := time.Now().Add(healthCheck + pongTimeout + 3*time.Second)
+	for len(p.standing()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a carrier whose pings go unanswered kept its slot")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestGoAwayStandsBy(t *testing.T) {
+	psk := "goaway-test"
+	p := newPool(fakeServer(t, psk, func(c *proxy.Conn) {
+		c.WriteControl(proxy.CtrlGoAway, []byte{proxy.GoAwayShutdown, 4, 't', 'e', 's', 't'})
+	}), []byte(psk), 1)
+	p.warm()
+	waitFor(t, "the carrier to stand by", func() bool { return len(p.standing()) > 0 })
+	if reason := p.standing()[0].goaway.Load(); reason == nil || *reason != "test" {
+		t.Fatalf("standby carrier's GOAWAY reason %v, want the server's", reason)
+	}
 }
 
 func waitFor(t *testing.T, what string, ok func() bool) {

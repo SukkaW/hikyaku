@@ -22,6 +22,18 @@ const (
 	replyResult byte = 0x21
 )
 
+// Carrier control messages travel outside smux (see Conn.WriteControl). The client
+// pings, the server answers with a pong echoing the ping's 4-byte id, and the server
+// sends GOAWAY, [code][length][reason], before it stops serving a carrier.
+const (
+	CtrlPing   byte = 0x01
+	CtrlPong   byte = 0x02
+	CtrlGoAway byte = 0x03
+)
+
+// GoAwayShutdown is the GOAWAY code for a server that is shutting down.
+const GoAwayShutdown byte = 1
+
 // Result codes a server reports after trying the destination.
 const (
 	ResultOK byte = iota

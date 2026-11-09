@@ -1,23 +1,10 @@
 package proxy
 
-import (
-	"sync"
-	"time"
-
-	"github.com/xtaci/smux"
-)
+import "github.com/xtaci/smux"
 
 // smux writes each frame with its 8-byte header in a single Write, so this keeps
 // every frame inside one encrypted chunk.
 const maxFramePayload = maxChunk - 8
-
-// KeepAliveInterval is how often each end sends smux keepalives; the client times
-// the server's to estimate queueing on each carrier.
-const KeepAliveInterval = 2 * time.Second
-
-// smuxNOP is smux's keepalive command; each keepalive arrives as one 8-byte frame
-// in a chunk of its own.
-const smuxNOP = 3
 
 func MuxConfig() *smux.Config {
 	c := smux.DefaultConfig()
@@ -29,36 +16,8 @@ func MuxConfig() *smux.Config {
 	// allocations; the session budget caps what one carrier can hold.
 	c.MaxStreamBuffer = 8 << 20
 	c.MaxReceiveBuffer = 32 << 20
-	// A steady keepalive gives the client a heartbeat to spot silent carriers; each
-	// one is a 42-byte chunk, which costs nothing even on a capped link.
-	c.KeepAliveInterval = KeepAliveInterval
+	// The client pings each carrier itself, outside smux and only when it would
+	// otherwise be quiet, so smux's fixed-interval keepalive is off.
+	c.KeepAliveDisabled = true
 	return c
-}
-
-// heartbeat turns the peer's fixed-interval keepalives into a queueing estimate:
-// how much later the latest one arrived than the schedule its earliest ones set.
-type heartbeat struct {
-	mu     sync.Mutex
-	first  time.Time
-	beats  int64
-	minLag time.Duration
-	lag    time.Duration
-}
-
-func (h *heartbeat) observe(t time.Time) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.beats == 0 {
-		h.first = t
-	}
-	lag := t.Sub(h.first) - time.Duration(h.beats)*KeepAliveInterval
-	h.minLag = min(h.minLag, lag)
-	h.lag = lag - h.minLag
-	h.beats++
-}
-
-func (h *heartbeat) current() time.Duration {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.lag
 }
