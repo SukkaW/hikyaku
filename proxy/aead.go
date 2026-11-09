@@ -23,35 +23,42 @@ const (
 	saltSize     = 32
 	maxChunk     = 16 << 10
 	helloVersion = 1
-	maxClockSkew = 60 * time.Second
-	replayWindow = 2 * maxClockSkew
+
+	replayGeneration     = 12 * time.Hour
+	replayGenerationSize = 100_000
 )
 
-var ErrReplay = errors.New("replayed or stale handshake")
+var ErrReplay = errors.New("replayed handshake")
 
-// ReplayFilter remembers client salts for as long as their hello timestamp is acceptable.
+// ReplayFilter remembers client salts in two generations: a new one starts once the
+// current one is replayGeneration old or holds replayGenerationSize salts, and the
+// oldest is dropped, so a salt is remembered for one to two generations. Salts are
+// random, so their first 8 bytes are key enough.
 type ReplayFilter struct {
-	mu   sync.Mutex
-	seen map[[saltSize]byte]time.Time
+	mu       sync.Mutex
+	current  map[uint64]struct{}
+	previous map[uint64]struct{}
+	started  time.Time
 }
 
 func NewReplayFilter() *ReplayFilter {
-	return &ReplayFilter{seen: make(map[[saltSize]byte]time.Time)}
+	return &ReplayFilter{current: make(map[uint64]struct{}), previous: make(map[uint64]struct{}), started: time.Now()}
 }
 
 func (f *ReplayFilter) firstSeen(salt []byte, now time.Time) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for k, t := range f.seen {
-		if now.Sub(t) > replayWindow {
-			delete(f.seen, k)
-		}
-	}
-	key := [saltSize]byte(salt)
-	if _, ok := f.seen[key]; ok {
+	key := binary.BigEndian.Uint64(salt)
+	if _, ok := f.current[key]; ok {
 		return false
 	}
-	f.seen[key] = now
+	if _, ok := f.previous[key]; ok {
+		return false
+	}
+	if now.Sub(f.started) >= replayGeneration || len(f.current) >= replayGenerationSize {
+		f.previous, f.current, f.started = f.current, make(map[uint64]struct{}), now
+	}
+	f.current[key] = struct{}{}
 	return true
 }
 
@@ -118,9 +125,9 @@ func ServerHandshake(conn net.Conn, psk []byte, replay *ReplayFilter) (*Conn, er
 	if len(hello) != 9 || hello[0] != helloVersion {
 		return nil, errors.New("unexpected client hello")
 	}
-	now := time.Now()
-	sent := time.Unix(int64(binary.BigEndian.Uint64(hello[1:])), 0)
-	if now.Sub(sent).Abs() > maxClockSkew || !replay.firstSeen(clientSalt, now) {
+	// The hello still carries the client's clock, but clocks are too often far off to
+	// reject on, so replays are caught by their salt alone.
+	if !replay.firstSeen(clientSalt, time.Now()) {
 		return nil, ErrReplay
 	}
 

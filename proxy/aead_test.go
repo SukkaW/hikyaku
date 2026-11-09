@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -130,6 +131,80 @@ func TestReplayedHelloRejected(t *testing.T) {
 	if r := <-result; !errors.Is(r.err, ErrReplay) {
 		t.Fatalf("replayed hello: got %v, want ErrReplay", r.err)
 	}
+}
+
+// clientHelloAt sends a client salt and hello whose clock reads sent.
+func clientHelloAt(conn net.Conn, psk []byte, sent time.Time) error {
+	c := newConn(conn)
+	salt := make([]byte, saltSize)
+	rand.Read(salt)
+	var err error
+	if c.seal, err = newAEAD(psk, salt, "hikyaku c2s"); err != nil {
+		return err
+	}
+	hello := make([]byte, 9)
+	hello[0] = helloVersion
+	binary.BigEndian.PutUint64(hello[1:], uint64(sent.Unix()))
+	return c.writeWithPrefix(salt, hello)
+}
+
+func TestSkewedClockAccepted(t *testing.T) {
+	psk := newPSK()
+	replay := NewReplayFilter()
+	day, year := 24*time.Hour, 365*24*time.Hour
+	for _, skew := range []time.Duration{-year, -day, day, year} {
+		clientRaw, serverRaw := tcpPair(t)
+		result := serve(serverRaw, psk, replay)
+		if err := clientHelloAt(clientRaw, psk, time.Now().Add(skew)); err != nil {
+			t.Fatal(err)
+		}
+		if r := <-result; r.err != nil {
+			t.Fatalf("hello from a clock %s off: %v", skew, r.err)
+		}
+	}
+}
+
+func TestReplayFilterGenerations(t *testing.T) {
+	newSalt := func() []byte {
+		salt := make([]byte, saltSize)
+		rand.Read(salt)
+		return salt
+	}
+	// rotate starts a new generation; one rotation keeps salt, a second drops it.
+	check := func(t *testing.T, rotate func(f *ReplayFilter, now time.Time) time.Time) {
+		f := NewReplayFilter()
+		now := f.started
+		salt := newSalt()
+		if !f.firstSeen(salt, now) {
+			t.Fatal("fresh salt rejected")
+		}
+		if f.firstSeen(salt, now) {
+			t.Fatal("repeated salt accepted")
+		}
+		now = rotate(f, now)
+		if f.firstSeen(salt, now) {
+			t.Fatal("salt forgotten after one rotation")
+		}
+		now = rotate(f, now)
+		if !f.firstSeen(salt, now) {
+			t.Fatal("salt still remembered after two rotations")
+		}
+	}
+	t.Run("age", func(t *testing.T) {
+		check(t, func(f *ReplayFilter, now time.Time) time.Time {
+			now = now.Add(replayGeneration)
+			f.firstSeen(newSalt(), now)
+			return now
+		})
+	})
+	t.Run("size", func(t *testing.T) {
+		check(t, func(f *ReplayFilter, now time.Time) time.Time {
+			for range replayGenerationSize {
+				f.firstSeen(newSalt(), now)
+			}
+			return now
+		})
+	})
 }
 
 func TestZeroRTT(t *testing.T) {
