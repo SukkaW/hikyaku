@@ -26,6 +26,8 @@ const (
 	slowMargin   = time.Second
 	slowStrikes  = 3
 	metricsEvery = 30 * time.Second
+	outageAfter  = 3 * time.Second
+	probeWait    = 5 * time.Second
 )
 
 var (
@@ -55,6 +57,7 @@ type pool struct {
 	carriers []*carrier
 	standby  []*carrier
 	opened   int
+	probing  atomic.Bool
 }
 
 func newPool(server string, psk []byte, carriers int) *pool {
@@ -202,8 +205,19 @@ func (p *pool) watch(c *carrier) verdict {
 		case <-c.session.CloseChan():
 			return closed
 		case <-tick.C:
-			if c.silent() {
+			quiet := p.linkQuiet()
+			if quiet {
+				p.probeOutage()
+			}
+			// A link-wide outage looks the same on every carrier, so while it lasts only
+			// acknowledged carriers go to standby, keeping their streams; new carriers
+			// keep waiting for their acknowledgement and the other rules wait too.
+			if c.silent() && (c.conn.Acked() || !quiet) {
 				return silent
+			}
+			if quiet {
+				strikes = 0
+				continue
 			}
 			if c.pongOverdue() {
 				return noPong
@@ -265,6 +279,60 @@ func (p *pool) slower(c *carrier) bool {
 		best = min(best, delay(o))
 	}
 	return delay(c)-best >= slowMargin
+}
+
+// linkQuiet reports a link-wide outage: some carriers have been acknowledged, yet
+// none of them has received anything for outageAfter. A carrier that was never
+// acknowledged has heard nothing real, so it counts neither way.
+func (p *pool) linkQuiet() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen := false
+	for _, c := range slices.Concat(p.carriers, p.standby) {
+		if c == nil || !c.conn.Acked() || c.session.IsClosed() {
+			continue
+		}
+		if time.Since(c.conn.LastRead()) < outageAfter {
+			return false
+		}
+		seen = true
+	}
+	return seen
+}
+
+// probeOutage dials one fresh carrier at a time while the link stays quiet.
+// Carriers whose path state was lost may never hear back, so the first acknowledged
+// probe is what ends the outage; it then serves from standby until slot 0 has an
+// acknowledged carrier again.
+func (p *pool) probeOutage() {
+	if !p.probing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer p.probing.Store(false)
+		log.Printf("link: nothing received for %s, probing", outageAfter)
+		for p.linkQuiet() {
+			c, err := p.dial()
+			if err != nil {
+				time.Sleep(minBackoff)
+				continue
+			}
+			deadline := time.Now().Add(probeWait)
+			for !c.conn.Acked() && !c.session.IsClosed() && time.Now().Before(deadline) {
+				time.Sleep(carrierPoll)
+			}
+			if !c.conn.Acked() {
+				c.session.Close()
+				continue
+			}
+			p.mu.Lock()
+			p.standby = append(p.standby, c)
+			p.mu.Unlock()
+			log.Printf("link: probe acknowledged, outage over")
+			go p.retire(c)
+			return
+		}
+	}()
 }
 
 // retire keeps a standby carrier for its existing streams, which survive a short
