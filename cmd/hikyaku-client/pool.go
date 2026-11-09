@@ -346,6 +346,13 @@ func (c *carrier) pongOverdue(d time.Duration) bool {
 	return false
 }
 
+// unresponsive reports whether c has left a ping unanswered for d and delivered no
+// data for as long. A busy carrier's pong can wait behind its own queue while its
+// data keeps arriving, which proves it alive.
+func (c *carrier) unresponsive(d time.Duration) bool {
+	return c.pongOverdue(d) && time.Since(c.conn.LastData()) >= d
+}
+
 func (c *carrier) ackOverdue() bool {
 	d := c.replyDeadline()
 	c.mu.Lock()
@@ -419,7 +426,7 @@ func (p *pool) watch(c *carrier) verdict {
 			// A link-wide outage looks the same on every carrier, so while it lasts only
 			// acknowledged carriers go to standby, keeping their streams; new carriers
 			// keep waiting for their acknowledgement and the other rules wait too.
-			if c.conn.Acked() && c.pongOverdue(c.replyDeadline()) {
+			if c.conn.Acked() && c.unresponsive(c.replyDeadline()) {
 				return silent
 			}
 			if !c.conn.Acked() && !quiet && now.Sub(c.ready) >= suspectAfter {
@@ -483,8 +490,9 @@ func slowerThan(mine, best time.Duration) bool {
 }
 
 // linkQuiet reports a link-wide outage: some carriers have been acknowledged, yet
-// every one of them has a ping unanswered past its reply deadline. A carrier that was
-// never acknowledged has heard nothing real, so it counts neither way.
+// every one of them has a ping unanswered past its reply deadline and no data for as
+// long. A carrier that was never acknowledged has heard nothing real, so it counts
+// neither way.
 func (p *pool) linkQuiet() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -493,7 +501,7 @@ func (p *pool) linkQuiet() bool {
 		if c == nil || !c.conn.Acked() || c.session.IsClosed() {
 			continue
 		}
-		if !c.pongOverdue(c.replyDeadline()) {
+		if !c.unresponsive(c.replyDeadline()) {
 			return false
 		}
 		seen = true
@@ -615,11 +623,11 @@ func (p *pool) pick() *carrier {
 		p.grow()
 	}
 	if best == nil {
-		// A standby carrier takes new streams only once its pings are answered again;
-		// that proves more than a new carrier still waiting for its acknowledgement. One
-		// the server is closing never does.
+		// A standby carrier takes new streams only once it answers pings or delivers
+		// data again; that proves more than a new carrier still waiting for its
+		// acknowledgement. One the server is closing never does.
 		best = fewestStreams(p.standby, func(c *carrier) bool {
-			return !c.pongOverdue(c.replyDeadline()) && c.goaway.Load() == nil
+			return !c.unresponsive(c.replyDeadline()) && c.goaway.Load() == nil
 		})
 	}
 	if best == nil {

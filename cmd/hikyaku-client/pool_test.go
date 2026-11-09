@@ -255,7 +255,7 @@ func TestReplyDeadline(t *testing.T) {
 
 // fakeServer accepts carriers and runs smux on them like the real server, but answers
 // no pings; onCarrier runs for each one.
-func fakeServer(t *testing.T, psk string, onCarrier func(*proxy.Conn)) string {
+func fakeServer(t *testing.T, psk string, onCarrier func(*proxy.Conn, *smux.Session)) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -274,10 +274,11 @@ func fakeServer(t *testing.T, psk string, onCarrier func(*proxy.Conn)) string {
 				if err != nil {
 					return
 				}
-				if _, err := smux.Server(c, proxy.MuxConfig()); err != nil {
+				session, err := smux.Server(c, proxy.MuxConfig())
+				if err != nil {
 					return
 				}
-				onCarrier(c)
+				onCarrier(c, session)
 			}()
 		}
 	}()
@@ -292,7 +293,7 @@ func (p *pool) standing() []*carrier {
 
 func TestUnansweredPingStandsBy(t *testing.T) {
 	psk := "unanswered-ping-test"
-	p := newPool(fakeServer(t, psk, func(*proxy.Conn) {}), []byte(psk), 1)
+	p := newPool(fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {}), []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
 	deadline := time.Now().Add(healthCheck + maxReplyDeadline + 3*time.Second)
@@ -304,9 +305,54 @@ func TestUnansweredPingStandsBy(t *testing.T) {
 	}
 }
 
+func TestDataKeepsCarrierAlive(t *testing.T) {
+	psk := "data-keeps-alive-test"
+	stop := make(chan struct{})
+	p := newPool(fakeServer(t, psk, func(_ *proxy.Conn, s *smux.Session) {
+		st, err := s.AcceptStream()
+		if err != nil {
+			return
+		}
+		tick := time.NewTicker(200 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				if _, err := st.Write(make([]byte, 64)); err != nil {
+					return
+				}
+			}
+		}
+	}), []byte(psk), 1)
+	p.warm()
+	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
+	p.mu.Lock()
+	c := p.carriers[0]
+	p.mu.Unlock()
+	// Opened on the session itself, so no acknowledgement is awaited on it.
+	if _, err := c.session.OpenStream(); err != nil {
+		t.Fatal(err)
+	}
+	// The server answers no pings but keeps sending data, which proves it alive.
+	time.Sleep(maxReplyDeadline + 2*healthCheck + time.Second)
+	if len(p.standing()) != 0 {
+		t.Fatal("a carrier still delivering data stood by because its pings went unanswered")
+	}
+	close(stop)
+	deadline := time.Now().Add(maxReplyDeadline + 3*time.Second)
+	for len(p.standing()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the carrier kept its slot after its data stopped as well")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestGoAwayStandsBy(t *testing.T) {
 	psk := "goaway-test"
-	p := newPool(fakeServer(t, psk, func(c *proxy.Conn) {
+	p := newPool(fakeServer(t, psk, func(c *proxy.Conn, _ *smux.Session) {
 		c.WriteControl(proxy.CtrlGoAway, []byte{proxy.GoAwayShutdown, 4, 't', 'e', 's', 't'})
 	}), []byte(psk), 1)
 	p.warm()
