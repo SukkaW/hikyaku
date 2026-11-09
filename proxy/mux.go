@@ -27,10 +27,12 @@ func MuxConfig() *smux.Config {
 	c := smux.DefaultConfig()
 	c.Version = 2
 	c.MaxFrameSize = maxFramePayload
-	// The per-stream window must exceed the GEO bandwidth-delay product
-	// (5 Mbit/s × 620 ms ≈ 388 KB), otherwise it caps single-stream throughput.
-	c.MaxStreamBuffer = 1 << 20
-	c.MaxReceiveBuffer = 8 << 20
+	// The per-stream window must exceed the path's bandwidth-delay product, otherwise
+	// it caps single-stream throughput: 8 MiB covers 500 Mbit/s at 50 ms (≈3 MB) even
+	// though smux only refreshes it after half is used. Windows are limits, not
+	// allocations; the session budget caps what one carrier can hold.
+	c.MaxStreamBuffer = 8 << 20
+	c.MaxReceiveBuffer = 32 << 20
 	// A steady keepalive gives the client a heartbeat to spot silent carriers; each
 	// one is a 42-byte chunk, which costs nothing even on a capped link.
 	c.KeepAliveInterval = KeepAliveInterval
