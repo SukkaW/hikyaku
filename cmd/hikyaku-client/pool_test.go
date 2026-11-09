@@ -222,6 +222,37 @@ func TestSlowerThan(t *testing.T) {
 	}
 }
 
+func TestReplyDeadline(t *testing.T) {
+	ms := time.Millisecond
+	c := &carrier{}
+	if got := c.replyDeadline(); got != maxReplyDeadline {
+		t.Fatalf("before any round trip: %s, want %s", got, maxReplyDeadline)
+	}
+	c.sample(620 * ms)
+	if got := c.replyDeadline(); got != maxReplyDeadline {
+		t.Fatalf("after one 620ms round trip: %s, want the %s cap, which 5 round trips pass", got, maxReplyDeadline)
+	}
+	mid := &carrier{}
+	mid.sample(300 * ms)
+	if got := mid.replyDeadline(); got != 1500*ms {
+		t.Fatalf("after one 300ms round trip: %s, want 5 round trips, above 300ms + 4 x 150ms", got)
+	}
+	steady := &carrier{}
+	for range 50 {
+		steady.sample(30 * ms)
+	}
+	if got := steady.replyDeadline(); got != minReplyDeadline {
+		t.Fatalf("steady 30ms round trips: %s, want the %s floor", got, minReplyDeadline)
+	}
+	jumpy := &carrier{}
+	for i := range 50 {
+		jumpy.sample(time.Duration(500+2000*(i%2)) * ms)
+	}
+	if got := jumpy.replyDeadline(); got != maxReplyDeadline {
+		t.Fatalf("round trips swinging 500-2500ms: %s, want the %s cap", got, maxReplyDeadline)
+	}
+}
+
 // fakeServer accepts carriers and runs smux on them like the real server, but answers
 // no pings; onCarrier runs for each one.
 func fakeServer(t *testing.T, psk string, onCarrier func(*proxy.Conn)) string {
@@ -264,7 +295,7 @@ func TestUnansweredPingStandsBy(t *testing.T) {
 	p := newPool(fakeServer(t, psk, func(*proxy.Conn) {}), []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
-	deadline := time.Now().Add(healthCheck + pongTimeout + 3*time.Second)
+	deadline := time.Now().Add(healthCheck + maxReplyDeadline + 3*time.Second)
 	for len(p.standing()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("a carrier whose pings go unanswered kept its slot")

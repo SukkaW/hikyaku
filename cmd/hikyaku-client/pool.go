@@ -22,12 +22,18 @@ const (
 	healthCheck  = 500 * time.Millisecond
 	carrierWait  = 10 * time.Second
 	carrierPoll  = 50 * time.Millisecond
-	ackTimeout   = 3 * time.Second
-	pongTimeout  = 3 * time.Second
 	slowStrikes  = 3
 	slowEvery    = 2 * time.Second
 	metricsEvery = 30 * time.Second
 	probeWait    = 5 * time.Second
+	// A ping or acknowledgement is overdue after TCP's retransmission timeout for the
+	// carrier (RFC 6298: SRTT + 4·RTTVAR) but never under replyRoundTrips smoothed
+	// round trips, kept within minReplyDeadline and maxReplyDeadline, and
+	// maxReplyDeadline until a round trip is measured. The round-trip floor keeps GEO,
+	// whose queues and loss recovery stretch replies well past RTTVAR, at the cap.
+	minReplyDeadline = time.Second
+	maxReplyDeadline = 3 * time.Second
+	replyRoundTrips  = 5
 	// Slowness is judged only from pongs to pings sent while a carrier carried no
 	// data, so a busy carrier's own queue cannot make it look slow: the median of its
 	// last quietSamples such round trips within quietWindow, needing minQuietSamples,
@@ -60,7 +66,6 @@ type carrier struct {
 	session *smux.Session
 	conn    *proxy.Conn
 	ready   time.Time
-	rtt     atomic.Int64 // smoothed round trip from pongs and acknowledgements in nanoseconds; 0 until the first
 	latest  atomic.Int64 // the latest of those round trips in nanoseconds; 0 until the first
 
 	lastStream atomic.Int64           // unix nanoseconds when a stream last closed
@@ -72,7 +77,9 @@ type carrier struct {
 	waiting    map[*carrierStream]time.Time // streams still waiting for their acknowledgement
 	pings      map[uint32]ping              // pings still waiting for their pong
 	nextPing   uint32
-	quiet      []sample // round trips of pings sent while quiet, oldest first
+	quiet      []sample      // round trips of pings sent while quiet, oldest first
+	srtt       time.Duration // smoothed round trip from pongs and acknowledgements (RFC 6298); 0 until the first
+	rttvar     time.Duration // its variation
 }
 
 type ping struct {
@@ -154,9 +161,9 @@ func (p *pool) maintain(slot int) {
 			p.toStandby(c)
 			c.moveUnanswered()
 			if v == noAck {
-				log.Printf("carrier %d: acknowledgement overdue by %s after %s, standing by", slot, ackTimeout, c.lifetime())
+				log.Printf("carrier %d: acknowledgement overdue by %s after %s, standing by", slot, c.replyDeadline(), c.lifetime())
 			} else {
-				log.Printf("carrier %d: silent for %s after %s, standing by", slot, pongTimeout, c.lifetime())
+				log.Printf("carrier %d: silent for %s after %s, standing by", slot, c.replyDeadline(), c.lifetime())
 			}
 			go p.retire(c)
 		case silent:
@@ -340,14 +347,26 @@ func (c *carrier) pongOverdue(d time.Duration) bool {
 }
 
 func (c *carrier) ackOverdue() bool {
+	d := c.replyDeadline()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, opened := range c.waiting {
-		if time.Since(opened) >= ackTimeout {
+		if time.Since(opened) >= d {
 			return true
 		}
 	}
 	return false
+}
+
+// replyDeadline is how long a ping or acknowledgement on c may take before c is
+// suspect.
+func (c *carrier) replyDeadline() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.srtt == 0 {
+		return maxReplyDeadline
+	}
+	return min(max(c.srtt+4*c.rttvar, replyRoundTrips*c.srtt, minReplyDeadline), maxReplyDeadline)
 }
 
 type verdict int
@@ -400,7 +419,7 @@ func (p *pool) watch(c *carrier) verdict {
 			// A link-wide outage looks the same on every carrier, so while it lasts only
 			// acknowledged carriers go to standby, keeping their streams; new carriers
 			// keep waiting for their acknowledgement and the other rules wait too.
-			if c.conn.Acked() && c.pongOverdue(pongTimeout) {
+			if c.conn.Acked() && c.pongOverdue(c.replyDeadline()) {
 				return silent
 			}
 			if !c.conn.Acked() && !quiet && now.Sub(c.ready) >= suspectAfter {
@@ -426,8 +445,11 @@ func (p *pool) watch(c *carrier) verdict {
 			}
 			if now.Sub(lastLog) >= metricsEvery {
 				lastLog = now
-				log.Printf("carrier %d: rtt %s, %d streams",
-					c.slot, time.Duration(c.rtt.Load()).Round(time.Millisecond), c.session.NumStreams())
+				c.mu.Lock()
+				srtt := c.srtt
+				c.mu.Unlock()
+				log.Printf("carrier %d: rtt %s, reply deadline %s, %d streams", c.slot, srtt.Round(time.Millisecond),
+					c.replyDeadline().Round(time.Millisecond), c.session.NumStreams())
 			}
 		}
 	}
@@ -461,8 +483,8 @@ func slowerThan(mine, best time.Duration) bool {
 }
 
 // linkQuiet reports a link-wide outage: some carriers have been acknowledged, yet
-// every one of them has a ping unanswered for pongTimeout. A carrier that was never
-// acknowledged has heard nothing real, so it counts neither way.
+// every one of them has a ping unanswered past its reply deadline. A carrier that was
+// never acknowledged has heard nothing real, so it counts neither way.
 func (p *pool) linkQuiet() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -471,7 +493,7 @@ func (p *pool) linkQuiet() bool {
 		if c == nil || !c.conn.Acked() || c.session.IsClosed() {
 			continue
 		}
-		if !c.pongOverdue(pongTimeout) {
+		if !c.pongOverdue(c.replyDeadline()) {
 			return false
 		}
 		seen = true
@@ -489,7 +511,7 @@ func (p *pool) probeOutage() {
 	}
 	go func() {
 		defer p.probing.Store(false)
-		log.Printf("link: no carrier answered a ping within %s, probing", pongTimeout)
+		log.Printf("link: no carrier answered a ping in time, probing")
 		for p.linkQuiet() {
 			c, err := p.dial()
 			if err != nil {
@@ -597,7 +619,7 @@ func (p *pool) pick() *carrier {
 		// that proves more than a new carrier still waiting for its acknowledgement. One
 		// the server is closing never does.
 		best = fewestStreams(p.standby, func(c *carrier) bool {
-			return !c.pongOverdue(pongTimeout) && c.goaway.Load() == nil
+			return !c.pongOverdue(c.replyDeadline()) && c.goaway.Load() == nil
 		})
 	}
 	if best == nil {
@@ -755,8 +777,16 @@ func (c *carrier) acknowledged(s *carrierStream, rtt time.Duration) {
 
 func (c *carrier) sample(rtt time.Duration) {
 	c.latest.Store(int64(rtt))
-	if old := c.rtt.Load(); old != 0 {
-		rtt = time.Duration(old) + (rtt-time.Duration(old))/4
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.srtt == 0 {
+		c.srtt, c.rttvar = rtt, rtt/2
+		return
 	}
-	c.rtt.Store(int64(rtt))
+	diff := c.srtt - rtt
+	if diff < 0 {
+		diff = -diff
+	}
+	c.rttvar += (diff - c.rttvar) / 4
+	c.srtt += (rtt - c.srtt) / 8
 }
