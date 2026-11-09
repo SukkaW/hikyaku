@@ -54,6 +54,7 @@ func main() {
 	downRate := flag.Float64("down-rate", 0, "bandwidth cap in Mbit/s from server to client (0: none)")
 	upRate := flag.Float64("up-rate", 0, "bandwidth cap in Mbit/s from client to server (0: none)")
 	queue := flag.Duration("queue", 250*time.Millisecond, "drop-tail queue in front of the bandwidth cap")
+	fair := flag.Bool("fq", false, "give each connection its own queue of that length at the bandwidth cap and serve them in turn, like a fair-queueing bottleneck")
 	outageEvery := flag.Duration("outage-every", 0, "mean time between outages that drop everything both ways (0: none)")
 	outageFor := flag.Duration("outage-for", 0, "mean outage length")
 	spikeEvery := flag.Duration("spike-every", 0, "mean time between latency spikes (0: none)")
@@ -87,6 +88,7 @@ func main() {
 			loss:       perDirection,
 			rate:       rate * 1e6 / 8,
 			queue:      *queue,
+			fair:       *fair && rate > 0,
 			rng:        rand.New(rand.NewPCG(*seed, stream)),
 			outages:    outages,
 			spikes:     spikes,
@@ -119,6 +121,9 @@ func main() {
 	}
 	fmt.Printf("netsim: rtt %s, %.4f%% loss per round trip (%.4f%% each way), down %s, up %s, %s queue",
 		*rtt, *loss, perDirection*100, rateString(*downRate), rateString(*upRate), *queue)
+	if *fair {
+		fmt.Print(" per connection, served in turn")
+	}
 	if *outageEvery > 0 {
 		fmt.Printf(", outages of ~%s every ~%s", *outageFor, *outageEvery)
 	}
@@ -232,6 +237,7 @@ type link struct {
 	loss  float64
 	rate  float64 // bytes per second; 0 means no cap
 	queue time.Duration
+	fair  bool // one queue per connection instead of one shared queue
 	rng   *rand.Rand
 
 	outages, spikes *events // shared by both directions
@@ -314,6 +320,10 @@ func (l *link) forward(src, dst *os.File) {
 	// enough to schedule them and the path never reorders packets.
 	out := make(chan packet, 1<<16)
 	go deliver(dst, out)
+	if l.fair {
+		l.forwardFair(src, out)
+		return
+	}
 	var busyUntil, lastDue time.Time
 	for {
 		buf := buffers.Get().(*[]byte)
@@ -346,6 +356,108 @@ func (l *link) forward(src, dst *os.File) {
 		}
 		lastDue = due
 		out <- packet{data: (*buf)[:n], buf: buf, due: due}
+	}
+}
+
+// flow identifies a connection by protocol, addresses and ports; packets that are
+// not IPv4 TCP or UDP share the zero flow.
+type flow struct {
+	proto            byte
+	src, dst         [4]byte
+	srcPort, dstPort uint16
+}
+
+func flowOf(b []byte) flow {
+	if len(b) < 20 || b[0]>>4 != 4 {
+		return flow{}
+	}
+	f := flow{proto: b[9], src: [4]byte(b[12:16]), dst: [4]byte(b[16:20])}
+	if ihl := int(b[0]&0x0f) * 4; (f.proto == 6 || f.proto == 17) && len(b) >= ihl+4 {
+		f.srcPort = uint16(b[ihl])<<8 | uint16(b[ihl+1])
+		f.dstPort = uint16(b[ihl+2])<<8 | uint16(b[ihl+3])
+	}
+	return f
+}
+
+// forwardFair queues each connection's packets separately, dropping a packet that
+// would take its own connection's queue past l.queue at the bandwidth cap, while a
+// sender serves the queues in turn, one packet each. A busy connection then waits
+// behind its own packets but not in front of other connections', as at a
+// fair-queueing bottleneck such as fq_codel.
+func (l *link) forwardFair(src *os.File, out chan<- packet) {
+	var mu sync.Mutex
+	queues := make(map[flow][]packet)
+	queued := make(map[flow]int) // bytes waiting per connection
+	var turns []flow             // connections with packets waiting, in serving order
+	wake := make(chan struct{}, 1)
+	limit := int(l.rate * l.queue.Seconds())
+	go func() {
+		var busyUntil, lastDue time.Time
+		for {
+			mu.Lock()
+			if len(turns) == 0 {
+				mu.Unlock()
+				<-wake
+				continue
+			}
+			f := turns[0]
+			turns = turns[1:]
+			p := queues[f][0]
+			queues[f] = queues[f][1:]
+			queued[f] -= len(p.data)
+			if len(queues[f]) > 0 {
+				turns = append(turns, f)
+			} else {
+				delete(queues, f)
+				delete(queued, f)
+			}
+			mu.Unlock()
+			now := time.Now()
+			start := now
+			if busyUntil.After(start) {
+				start = busyUntil
+			}
+			start = l.resume(start)
+			busyUntil = start.Add(time.Duration(float64(len(p.data)) / l.rate * float64(time.Second)))
+			// One packet is on the wire at a time, so the next turn is chosen only once
+			// this one has left, letting connections that wake meanwhile go next.
+			time.Sleep(time.Until(busyUntil))
+			due := busyUntil.Add(l.delay + l.spikes.at(now)/2)
+			if due.Before(lastDue) {
+				due = lastDue
+			}
+			lastDue = due
+			p.due = due
+			out <- p
+		}
+	}()
+	for {
+		buf := buffers.Get().(*[]byte)
+		n, err := src.Read(*buf)
+		if err != nil {
+			log.Fatalf("read %s: %v", src.Name(), err)
+		}
+		if l.outages.at(time.Now()) > 0 || (l.loss > 0 && l.rng.Float64() < l.loss) {
+			buffers.Put(buf)
+			continue
+		}
+		f := flowOf((*buf)[:n])
+		mu.Lock()
+		if queued[f]+n > limit {
+			mu.Unlock()
+			buffers.Put(buf)
+			continue
+		}
+		if len(queues[f]) == 0 {
+			turns = append(turns, f)
+		}
+		queues[f] = append(queues[f], packet{data: (*buf)[:n], buf: buf})
+		queued[f] += n
+		mu.Unlock()
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
 	}
 }
 

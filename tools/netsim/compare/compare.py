@@ -34,7 +34,9 @@ def each_way(percent):
 # name: (label, netsim arguments). The first four are synthetic paths, with 620 ms /
 # 10% uniform loss kept as a harsh stress test. The rest approximate measured in-flight
 # Wi-Fi: GEO round trips of 620-750 ms with little random loss, and Starlink with
-# 30-65 ms; outage, spike and queue settings are engineering estimates.
+# 30-65 ms; outage, spike and queue settings are engineering estimates. geo-congested-fq
+# is congested GEO behind a bottleneck that queues each connection separately; whether
+# real cabin links do so is unknown.
 PROFILES = {
     "10ms": ("10 ms, 0% loss, 500 Mbit/s", ["-rtt", "10ms", "-down-rate", "500", "-up-rate", "500"]),
     "50ms": ("50 ms, 0% loss, 500 Mbit/s", ["-rtt", "50ms", "-down-rate", "500", "-up-rate", "500"]),
@@ -45,6 +47,8 @@ PROFILES = {
                     ["-rtt", "700ms", "-loss", each_way(0.05), "-down-rate", "50", "-up-rate", "4", "-queue", "100ms"]),
     "geo-congested": ("Congested GEO: 620 ms, queue drops only, 5.9/3.9 Mbit/s",
                       ["-rtt", "620ms", "-down-rate", "5.9", "-up-rate", "3.9", "-queue", "250ms"]),
+    "geo-congested-fq": ("Congested GEO, queued per connection: 620 ms, 5.9/3.9 Mbit/s",
+                         ["-rtt", "620ms", "-down-rate", "5.9", "-up-rate", "3.9", "-queue", "250ms", "-fq"]),
     "geo-impaired": ("Impaired GEO: 750 ms, 0.1% loss each way, ~10 s blackouts every ~90 s, 5/1 Mbit/s",
                      ["-rtt", "750ms", "-loss", each_way(0.1), "-outage-every", "90s", "-outage-for", "10s",
                       "-down-rate", "5", "-up-rate", "1", "-queue", "250ms"]),
