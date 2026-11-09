@@ -11,10 +11,6 @@ import (
 // every frame inside one encrypted chunk.
 const maxFramePayload = maxChunk - 8
 
-// Pong is the first byte the server sends on every stream, as soon as it has read
-// the request and before the website answers, so the client can time the carrier.
-const Pong byte = 0
-
 // KeepAliveInterval is how often each end sends smux keepalives; the client times
 // the server's to estimate queueing on each carrier.
 const KeepAliveInterval = 2 * time.Second

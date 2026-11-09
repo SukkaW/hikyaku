@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -126,6 +127,26 @@ func TestEndToEnd(t *testing.T) {
 		case <-aborted:
 		case <-time.After(5 * time.Second):
 			t.Fatal("origin kept streaming after the client cancelled")
+		}
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		closed, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := closed.Addr().String()
+		closed.Close() // nothing listens there now, so the server's dial is refused
+		conn, err := client.DialContext(context.Background(), "tcp", address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err = conn.Read(make([]byte, 1))
+		var timeout net.Error
+		if err == nil || (errors.As(err, &timeout) && timeout.Timeout()) {
+			t.Fatalf("read: got %v, want the connection closed once the server reports the refusal", err)
 		}
 	})
 

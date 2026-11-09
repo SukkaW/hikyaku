@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -133,35 +132,47 @@ func TestReplayedHelloRejected(t *testing.T) {
 	}
 }
 
-// clientHelloAt sends a client salt and hello whose clock reads sent.
-func clientHelloAt(conn net.Conn, psk []byte, sent time.Time) error {
+// clientWithHello starts a client handshake that sends hello instead of the client's
+// own, so a test can speak as another protocol version.
+func clientWithHello(conn net.Conn, psk, hello []byte) (*Conn, error) {
 	c := newConn(conn)
-	salt := make([]byte, saltSize)
-	rand.Read(salt)
+	c.psk = psk
+	c.clientSalt = make([]byte, saltSize)
+	rand.Read(c.clientSalt)
 	var err error
-	if c.seal, err = newAEAD(psk, salt, "hikyaku c2s"); err != nil {
-		return err
+	if c.seal, err = newAEAD(psk, c.clientSalt, "hikyaku c2s"); err != nil {
+		return nil, err
 	}
-	hello := make([]byte, 9)
-	hello[0] = helloVersion
-	binary.BigEndian.PutUint64(hello[1:], uint64(sent.Unix()))
-	return c.writeWithPrefix(salt, hello)
+	return c, c.writeWithPrefix(c.clientSalt, hello)
 }
 
-func TestSkewedClockAccepted(t *testing.T) {
-	psk := newPSK()
-	replay := NewReplayFilter()
-	day, year := 24*time.Hour, 365*24*time.Hour
-	for _, skew := range []time.Duration{-year, -day, day, year} {
+func TestHelloVersion(t *testing.T) {
+	t.Run("a newer client is answered with the version both speak", func(t *testing.T) {
+		psk := newPSK()
 		clientRaw, serverRaw := tcpPair(t)
-		result := serve(serverRaw, psk, replay)
-		if err := clientHelloAt(clientRaw, psk, time.Now().Add(skew)); err != nil {
+		result := serve(serverRaw, psk, NewReplayFilter())
+		client, err := clientWithHello(clientRaw, psk, []byte{helloVersion + 1})
+		if err != nil {
 			t.Fatal(err)
 		}
 		if r := <-result; r.err != nil {
-			t.Fatalf("hello from a clock %s off: %v", skew, r.err)
+			t.Fatal(r.err)
 		}
-	}
+		if err := client.awaitAck(); err != nil {
+			t.Fatalf("acknowledgement: %v", err)
+		}
+	})
+	t.Run("the old hello with a timestamp is rejected", func(t *testing.T) {
+		psk := newPSK()
+		clientRaw, serverRaw := tcpPair(t)
+		result := serve(serverRaw, psk, NewReplayFilter())
+		if _, err := clientWithHello(clientRaw, psk, make([]byte, 9)); err != nil {
+			t.Fatal(err)
+		}
+		if r := <-result; r.err == nil {
+			t.Fatal("server accepted a 9-byte hello")
+		}
+	})
 }
 
 func TestReplayFilterGenerations(t *testing.T) {

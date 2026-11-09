@@ -1,17 +1,23 @@
 package main
 
 import (
+	"errors"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/things-go/go-socks5/statute"
+	"github.com/SukkaW/hikyaku/proxy"
 )
 
 const (
 	maxReplayBuffer = 64 << 10
 	maxReplays      = 2
+	// requestDelay is how long a new stream's request waits to share one write with
+	// the app's first bytes. Client-first protocols (TLS, HTTP) send theirs sooner;
+	// server-first ones (SSH, SMTP) get the request alone after this long.
+	requestDelay = 10 * time.Millisecond
 )
 
 // replayStream relays one app connection over a carrier stream. Until the first
@@ -21,7 +27,7 @@ const (
 // starts a fresh TLS session at the origin, while a plain request could run twice.
 type replayStream struct {
 	h           *inbound
-	destination statute.AddrSpec
+	destination proxy.Addr
 
 	stream     atomic.Pointer[carrierStream]
 	carrier    atomic.Pointer[carrier]
@@ -32,11 +38,13 @@ type replayStream struct {
 
 	mu      sync.Mutex // serializes Write, buffering and replays
 	started bool
+	request []byte // not sent yet: waiting to ride with the app's first bytes
+	flush   *time.Timer
 	sent    []byte
 	replays int
 }
 
-func newReplayStream(h *inbound, destination statute.AddrSpec) (*replayStream, error) {
+func newReplayStream(h *inbound, destination proxy.Addr) (*replayStream, error) {
 	r := &replayStream{h: h, destination: destination}
 	if err := r.attach(); err != nil {
 		return nil, err
@@ -44,17 +52,26 @@ func newReplayStream(h *inbound, destination statute.AddrSpec) (*replayStream, e
 	return r, nil
 }
 
-// attach opens a stream on the best carrier and resends what the app already sent.
+// attach opens a stream on the best carrier. A replay resends the request with what
+// the app already sent; a new stream holds its request for the app's first bytes.
 func (r *replayStream) attach() error {
-	c, s, err := r.h.open(r.destination)
+	c, s, err := r.h.pool.openStream()
 	if err != nil {
 		return err
 	}
+	request, err := proxy.AppendConnect(nil, r.destination)
+	if err != nil {
+		s.Close()
+		return err
+	}
 	if len(r.sent) > 0 {
-		if _, err := s.Write(r.sent); err != nil {
+		if _, err := s.Write(append(request, r.sent...)); err != nil {
 			s.Close()
 			return err
 		}
+	} else {
+		r.request = request
+		r.flush = time.AfterFunc(requestDelay, r.flushRequest)
 	}
 	r.stream.Store(s)
 	r.carrier.Store(c)
@@ -63,6 +80,17 @@ func (r *replayStream) attach() error {
 		c.track(r)
 	}
 	return nil
+}
+
+// flushRequest sends a request the app gave no bytes to ride with.
+func (r *replayStream) flushRequest() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.request != nil {
+		// A failed write shows up on the stream's next Read or Write.
+		r.stream.Load().Write(r.request)
+		r.request = nil
+	}
 }
 
 func (r *replayStream) Write(b []byte) (int, error) {
@@ -83,12 +111,21 @@ func (r *replayStream) Write(b []byte) (int, error) {
 		}
 	}
 	s := r.stream.Load()
-	n, err := s.Write(b)
+	out := b
+	if r.request != nil {
+		r.flush.Stop()
+		out = append(r.request, b...)
+		r.request = nil
+	}
+	_, err := s.Write(out)
 	if err != nil && r.replayLocked(s) {
 		// b went out with the buffer resent on the new stream.
 		return len(b), nil
 	}
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (r *replayStream) Read(b []byte) (int, error) {
@@ -97,6 +134,11 @@ func (r *replayStream) Read(b []byte) (int, error) {
 		n, err := s.Read(b)
 		if n > 0 {
 			r.markAnswered()
+			return n, err
+		}
+		var failed *proxy.ResultError
+		if errors.As(err, &failed) {
+			log.Printf("%s: %v", r.destination, err)
 			return n, err
 		}
 		r.mu.Lock()
@@ -162,6 +204,9 @@ func (r *replayStream) abandon(c *carrier) {
 
 func (r *replayStream) Close() error {
 	r.closed.Store(true)
+	if r.flush != nil {
+		r.flush.Stop()
+	}
 	r.carrier.Load().untrack(r)
 	return r.stream.Load().Close()
 }

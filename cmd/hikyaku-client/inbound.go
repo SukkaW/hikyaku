@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -43,7 +45,7 @@ func (h *inbound) connect(_ context.Context, writer io.Writer, request *socks5.R
 	if !ok {
 		return errNotConn
 	}
-	stream, err := newReplayStream(h, *request.DestAddr)
+	stream, err := newReplayStream(h, toAddr(*request.DestAddr))
 	if err != nil {
 		socks5.SendReply(writer, statute.RepHostUnreachable, nil)
 		return err
@@ -80,12 +82,16 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 		return err
 	}
 	defer udp.Close()
-	_, stream, err := h.open(proxy.UDPRequest)
+	_, stream, err := h.pool.openStream()
 	if err != nil {
 		socks5.SendReply(writer, statute.RepServerFailure, nil)
 		return err
 	}
 	defer stream.Close()
+	if _, err := stream.Write(proxy.UDPRequest); err != nil {
+		socks5.SendReply(writer, statute.RepServerFailure, nil)
+		return err
+	}
 	if err := socks5.SendReply(writer, statute.RepSuccess, udp.LocalAddr()); err != nil {
 		return err
 	}
@@ -103,11 +109,12 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 			if !from.IP.Equal(peer.IP) {
 				continue
 			}
-			if d, err := statute.ParseDatagram(buf[:n]); err != nil || d.Frag != 0 {
+			d, err := statute.ParseDatagram(buf[:n])
+			if err != nil || d.Frag != 0 {
 				continue
 			}
 			client.Store(from)
-			if proxy.WritePacket(stream, buf[:n]) != nil {
+			if proxy.WritePacket(stream, toAddr(d.DstAddr), d.Data) != nil {
 				return
 			}
 		}
@@ -116,12 +123,17 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 		defer conn.Close()
 		buf := make([]byte, proxy.MaxPacket)
 		for {
-			p, err := proxy.ReadPacket(stream, buf)
+			source, payload, err := proxy.ReadPacket(stream, buf)
 			if err != nil {
+				var failed *proxy.ResultError
+				if errors.As(err, &failed) {
+					log.Printf("udp: %v", err)
+				}
 				return
 			}
 			if to := client.Load(); to != nil {
-				udp.WriteToUDP(p, to)
+				reply := statute.Datagram{DstAddr: toSpec(source), Data: payload}
+				udp.WriteToUDP(reply.Bytes(), to)
 			}
 		}
 	}()
@@ -129,18 +141,23 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 	return nil
 }
 
-// open writes the destination as soon as the stream exists, so protocols where
-// the server speaks first still reach it.
-func (h *inbound) open(destination statute.AddrSpec) (*carrier, *carrierStream, error) {
-	c, stream, err := h.pool.openStream()
-	if err != nil {
-		return nil, nil, err
+func toAddr(spec statute.AddrSpec) proxy.Addr {
+	if spec.FQDN != "" {
+		return proxy.Addr{Domain: spec.FQDN, Port: uint16(spec.Port)}
 	}
-	if err := proxy.WriteRequest(stream, destination); err != nil {
-		stream.Close()
-		return nil, nil, err
+	ip, _ := netip.AddrFromSlice(spec.IP)
+	return proxy.Addr{IP: ip.Unmap(), Port: uint16(spec.Port)}
+}
+
+func toSpec(addr proxy.Addr) statute.AddrSpec {
+	if addr.Domain != "" {
+		return statute.AddrSpec{FQDN: addr.Domain, Port: int(addr.Port), AddrType: statute.ATYPDomain}
 	}
-	return c, stream, nil
+	spec := statute.AddrSpec{IP: addr.IP.AsSlice(), Port: int(addr.Port), AddrType: statute.ATYPIPv6}
+	if addr.IP.Is4() {
+		spec.AddrType = statute.ATYPIPv4
+	}
+	return spec
 }
 
 type bufferedConn struct {

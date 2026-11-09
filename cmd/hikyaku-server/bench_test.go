@@ -32,8 +32,8 @@ func BenchmarkDownload(b *testing.B) {
 			}()
 		}
 	}()
-	stream := openStream(b, true, addrOf(b, origin.Addr()))
-	readPong(b, stream)
+	stream := openStream(b, true, connectTo(b, origin.Addr()))
+	readReplies(b, stream)
 	const step = 1 << 20
 	b.SetBytes(step)
 	b.ResetTimer()

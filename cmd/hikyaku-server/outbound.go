@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	"github.com/things-go/go-socks5/statute"
 	"github.com/xtaci/smux"
 )
 
@@ -53,25 +52,53 @@ func public(addr netip.Addr) bool {
 func (o *outbound) handle(stream *smux.Stream) {
 	defer stream.Close()
 	stream.SetReadDeadline(time.Now().Add(headerTimeout))
-	destination, err := proxy.ReadRequest(stream)
+	destination, udp, err := proxy.ReadRequest(stream)
 	if err != nil {
 		return
 	}
 	stream.SetReadDeadline(time.Time{})
-	if _, err := stream.Write([]byte{proxy.Pong}); err != nil {
+	if err := proxy.WriteAck(stream); err != nil {
 		return
 	}
 
-	if destination.FQDN == proxy.UDPDestination {
+	if udp {
 		o.relayUDP(stream)
 		return
 	}
 	conn, err := o.dialer.DialContext(context.Background(), "tcp", destination.String())
 	if err != nil {
-		log.Printf("dial %s: %v", destination.String(), err)
+		log.Printf("dial %s: %v", destination, err)
+		proxy.WriteResult(stream, resultCode(err), err.Error())
+		return
+	}
+	if err := proxy.WriteResult(stream, proxy.ResultOK, ""); err != nil {
+		conn.Close()
 		return
 	}
 	proxy.Relay(conn, stream)
+}
+
+// resultCode tells the client why reaching the destination failed, so it can
+// separate a dead website from a dead carrier.
+func resultCode(err error) byte {
+	var dnsErr *net.DNSError
+	var netErr net.Error
+	switch {
+	case errors.Is(err, errForbidden):
+		return proxy.ResultBlocked
+	case errors.As(err, &dnsErr):
+		return proxy.ResultDNS
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return proxy.ResultRefused
+	case errors.Is(err, syscall.ENETUNREACH):
+		return proxy.ResultNetUnreachable
+	case errors.Is(err, syscall.EHOSTUNREACH):
+		return proxy.ResultHostUnreachable
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return proxy.ResultTimeout
+	default:
+		return proxy.ResultServerError
+	}
 }
 
 // relayUDP serves a udp-over-tcp stream from one UDP socket: packets from the stream
@@ -80,9 +107,13 @@ func (o *outbound) relayUDP(stream net.Conn) {
 	udp, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		log.Printf("udp: %v", err)
+		proxy.WriteResult(stream, proxy.ResultServerError, err.Error())
 		return
 	}
 	defer udp.Close()
+	if err := proxy.WriteResult(stream, proxy.ResultOK, ""); err != nil {
+		return
+	}
 	go func() {
 		defer stream.Close()
 		buf := make([]byte, proxy.MaxPacket)
@@ -91,8 +122,8 @@ func (o *outbound) relayUDP(stream net.Conn) {
 			if err != nil {
 				return
 			}
-			reply := statute.Datagram{DstAddr: addrSpec(from), Data: buf[:n]}
-			if proxy.WritePacket(stream, reply.Bytes()) != nil {
+			source := proxy.Addr{IP: from.Addr().Unmap(), Port: from.Port()}
+			if proxy.WritePacket(stream, source, buf[:n]) != nil {
 				return
 			}
 		}
@@ -101,53 +132,34 @@ func (o *outbound) relayUDP(stream net.Conn) {
 	resolved := make(map[string]netip.Addr)
 	buf := make([]byte, proxy.MaxPacket)
 	for {
-		p, err := proxy.ReadPacket(stream, buf)
+		dst, payload, err := proxy.ReadPacket(stream, buf)
 		if err != nil {
 			return
 		}
-		d, err := statute.ParseDatagram(p)
-		if err != nil || d.Frag != 0 {
-			continue
-		}
-		if to, ok := o.udpTarget(d.DstAddr, resolved); ok {
-			udp.WriteToUDPAddrPort(d.Data, to)
+		if to, ok := o.udpTarget(dst, resolved); ok {
+			udp.WriteToUDPAddrPort(payload, to)
 		}
 	}
 }
 
 // udpTarget applies the destination policy to a datagram, resolving names once per
 // association.
-func (o *outbound) udpTarget(dst statute.AddrSpec, resolved map[string]netip.Addr) (netip.AddrPort, bool) {
-	var addr netip.Addr
-	if dst.FQDN != "" {
+func (o *outbound) udpTarget(dst proxy.Addr, resolved map[string]netip.Addr) (netip.AddrPort, bool) {
+	addr := dst.IP.Unmap()
+	if dst.Domain != "" {
 		var ok bool
-		addr, ok = resolved[dst.FQDN]
+		addr, ok = resolved[dst.Domain]
 		if !ok {
-			if addr, ok = resolve(dst.FQDN); !ok {
+			if addr, ok = resolve(dst.Domain); !ok {
 				return netip.AddrPort{}, false
 			}
-			resolved[dst.FQDN] = addr
+			resolved[dst.Domain] = addr
 		}
-	} else {
-		var ok bool
-		if addr, ok = netip.AddrFromSlice(dst.IP); !ok {
-			return netip.AddrPort{}, false
-		}
-		addr = addr.Unmap()
 	}
 	if !o.allowPrivate && !public(addr) {
 		return netip.AddrPort{}, false
 	}
-	return netip.AddrPortFrom(addr, uint16(dst.Port)), true
-}
-
-func addrSpec(ap netip.AddrPort) statute.AddrSpec {
-	addr := ap.Addr().Unmap()
-	spec := statute.AddrSpec{IP: addr.AsSlice(), Port: int(ap.Port()), AddrType: statute.ATYPIPv6}
-	if addr.Is4() {
-		spec.AddrType = statute.ATYPIPv4
-	}
-	return spec
+	return netip.AddrPortFrom(addr, dst.Port), true
 }
 
 func resolve(host string) (netip.Addr, bool) {

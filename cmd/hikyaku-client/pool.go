@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"io"
 	"log"
 	"net"
 	"slices"
@@ -22,7 +21,7 @@ const (
 	healthCheck  = 500 * time.Millisecond
 	carrierWait  = 10 * time.Second
 	carrierPoll  = 50 * time.Millisecond
-	pongTimeout  = 3 * time.Second
+	ackTimeout   = 3 * time.Second
 	slowMargin   = time.Second
 	slowStrikes  = 3
 	metricsEvery = 30 * time.Second
@@ -30,21 +29,18 @@ const (
 	probeWait    = 5 * time.Second
 )
 
-var (
-	errNoCarrier = errors.New("no carrier is ready")
-	errBadPong   = errors.New("stream did not start with a pong")
-)
+var errNoCarrier = errors.New("no carrier is ready")
 
 type carrier struct {
 	slot    int
 	session *smux.Session
 	conn    *proxy.Conn
 	ready   time.Time
-	rtt     atomic.Int64 // smoothed pong round trip in nanoseconds; 0 until the first pong
+	rtt     atomic.Int64 // smoothed acknowledgement round trip in nanoseconds; 0 until the first one
 
 	mu         sync.Mutex
 	unanswered map[*replayStream]struct{}
-	waiting    map[*carrierStream]time.Time // streams still waiting for their pong
+	waiting    map[*carrierStream]time.Time // streams still waiting for their acknowledgement
 }
 
 // pool opens carriers on demand, up to a fixed number of slots; an opened slot is
@@ -99,7 +95,7 @@ func (p *pool) maintain(slot int) {
 		p.set(slot, c)
 		log.Printf("carrier %d: ready", slot)
 		v := p.watch(c)
-		silent := v == silent || v == noPong
+		silent := v == silent || v == noAck
 		switch {
 		case v == slow:
 			p.toStandby(c)
@@ -110,8 +106,8 @@ func (p *pool) maintain(slot int) {
 		case silent && c.conn.Acked():
 			p.toStandby(c)
 			c.moveUnanswered()
-			if v == noPong {
-				log.Printf("carrier %d: pong overdue by %s after %s, standing by", slot, pongTimeout, c.lifetime())
+			if v == noAck {
+				log.Printf("carrier %d: acknowledgement overdue by %s after %s, standing by", slot, ackTimeout, c.lifetime())
 			} else {
 				log.Printf("carrier %d: silent for %s after %s, standing by", slot, suspectAfter, c.lifetime())
 			}
@@ -193,11 +189,11 @@ func (c *carrier) silent() bool {
 	return time.Since(c.conn.LastRead()) >= suspectAfter
 }
 
-func (c *carrier) pongOverdue() bool {
+func (c *carrier) ackOverdue() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, opened := range c.waiting {
-		if time.Since(opened) >= pongTimeout {
+		if time.Since(opened) >= ackTimeout {
 			return true
 		}
 	}
@@ -209,13 +205,13 @@ type verdict int
 const (
 	closed verdict = iota
 	silent
-	noPong
+	noAck
 	slow
 )
 
 // watch reports why a carrier should leave its slot: its session closed, it went
-// silent, a stream's pong is overdue, or it stayed clearly slower than the best
-// other carrier for slowStrikes heartbeats in a row.
+// silent, a stream's acknowledgement is overdue, or it stayed clearly slower than the
+// best other carrier for slowStrikes heartbeats in a row.
 func (p *pool) watch(c *carrier) verdict {
 	tick := time.NewTicker(healthCheck)
 	defer tick.Stop()
@@ -240,8 +236,8 @@ func (p *pool) watch(c *carrier) verdict {
 				strikes = 0
 				continue
 			}
-			if c.pongOverdue() {
-				return noPong
+			if c.ackOverdue() {
+				return noAck
 			}
 			if time.Since(lastBeat) >= proxy.KeepAliveInterval {
 				lastBeat = time.Now()
@@ -266,7 +262,8 @@ func (p *pool) watch(c *carrier) verdict {
 
 // slower reports whether c's delay exceeds the best other acknowledged carrier's by
 // slowMargin. Delay is the larger of the heartbeat lag and how far the carrier's
-// pong round trip sits above the fastest one; with no other carrier, nothing is slow.
+// acknowledgement round trip sits above the fastest one; with no other carrier,
+// nothing is slow.
 func (p *pool) slower(c *carrier) bool {
 	if !c.conn.Acked() {
 		return false
@@ -461,13 +458,15 @@ func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 	return best
 }
 
-// carrierStream strips the server's pong from the front of a stream and turns it
-// into a round-trip sample for its carrier.
+// carrierStream strips the server's acknowledgement and result from the front of a
+// stream: the acknowledgement becomes a round-trip sample for its carrier, and a
+// failed result ends the stream with the server's reason.
 type carrierStream struct {
 	*smux.Stream
-	c      *carrier
-	opened time.Time
-	ponged bool // only touched by the single reader
+	c         *carrier
+	opened    time.Time
+	requested atomic.Int64 // unix nanoseconds of the first write, which carries the request
+	answered  bool         // only touched by the single reader
 }
 
 func (c *carrier) newStream(s *smux.Stream) *carrierStream {
@@ -481,17 +480,21 @@ func (c *carrier) newStream(s *smux.Stream) *carrierStream {
 	return cs
 }
 
+func (s *carrierStream) Write(b []byte) (int, error) {
+	s.requested.CompareAndSwap(0, time.Now().UnixNano())
+	return s.Stream.Write(b)
+}
+
 func (s *carrierStream) Read(b []byte) (int, error) {
-	if !s.ponged {
-		var p [1]byte
-		if _, err := io.ReadFull(s.Stream, p[:]); err != nil {
+	if !s.answered {
+		if err := proxy.ReadAck(s.Stream); err != nil {
 			return 0, err
 		}
-		if p[0] != proxy.Pong {
-			return 0, errBadPong
+		s.c.acknowledged(s, time.Since(time.Unix(0, s.requested.Load())))
+		if err := proxy.ReadResult(s.Stream); err != nil {
+			return 0, err
 		}
-		s.ponged = true
-		s.c.pong(s, time.Since(s.opened))
+		s.answered = true
 	}
 	return s.Stream.Read(b)
 }
@@ -503,7 +506,7 @@ func (s *carrierStream) Close() error {
 	return s.Stream.Close()
 }
 
-func (c *carrier) pong(s *carrierStream, rtt time.Duration) {
+func (c *carrier) acknowledged(s *carrierStream, rtt time.Duration) {
 	c.mu.Lock()
 	delete(c.waiting, s)
 	c.mu.Unlock()

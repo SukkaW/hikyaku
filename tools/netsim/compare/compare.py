@@ -57,7 +57,7 @@ PROFILES = {
                           "-down-rate", "65", "-up-rate", "24", "-queue", "150ms"]),
 }
 # hikyaku client log lines that mark a carrier health decision.
-CARRIER_EVENTS = {"slow": "slower than", "pong overdue": "pong overdue", "silent": "silent for",
+CARRIER_EVENTS = {"slow": "slower than", "acknowledgement overdue": "acknowledgement overdue", "silent": "silent for",
                   "no acknowledgement": "no acknowledgement", "link probing": "probing"}
 SMALL = "https://localhost:9443/"
 BIG = "http://localhost:9001/big?n={}"

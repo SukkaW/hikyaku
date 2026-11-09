@@ -20,9 +20,11 @@ import (
 const (
 	PSKSize = 32
 
-	saltSize     = 32
-	maxChunk     = 16 << 10
-	helloVersion = 1
+	saltSize = 32
+	maxChunk = 16 << 10
+	// helloVersion is the wire protocol version; every format before the first
+	// release is 0, and numbering starts there.
+	helloVersion = 0
 
 	replayGeneration     = 12 * time.Hour
 	replayGenerationSize = 100_000
@@ -99,10 +101,7 @@ func ClientHandshake(conn net.Conn, psk []byte) (*Conn, error) {
 	if c.seal, err = newAEAD(psk, c.clientSalt, "hikyaku c2s"); err != nil {
 		return nil, err
 	}
-	hello := make([]byte, 9)
-	hello[0] = helloVersion
-	binary.BigEndian.PutUint64(hello[1:], uint64(time.Now().Unix()))
-	if err := c.writeWithPrefix(c.clientSalt, hello); err != nil {
+	if err := c.writeWithPrefix(c.clientSalt, []byte{helloVersion}); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -122,21 +121,22 @@ func ServerHandshake(conn net.Conn, psk []byte, replay *ReplayFilter) (*Conn, er
 	if err != nil {
 		return nil, fmt.Errorf("read client hello: %w", err)
 	}
-	if len(hello) != 9 || hello[0] != helloVersion {
+	if len(hello) != 1 {
 		return nil, errors.New("unexpected client hello")
 	}
-	// The hello still carries the client's clock, but clocks are too often far off to
-	// reject on, so replays are caught by their salt alone.
 	if !replay.firstSeen(clientSalt, time.Now()) {
 		return nil, ErrReplay
 	}
+	// The hello names the newest version the client speaks; the server answers with
+	// the newest one both speak, which the client then accepts or gives up on.
+	version := min(hello[0], helloVersion)
 
 	serverSalt := make([]byte, saltSize)
 	rand.Read(serverSalt)
 	if c.seal, err = newAEAD(psk, append(serverSalt, clientSalt...), "hikyaku s2c"); err != nil {
 		return nil, err
 	}
-	if err := c.writeWithPrefix(serverSalt, []byte{helloVersion}); err != nil {
+	if err := c.writeWithPrefix(serverSalt, []byte{version}); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -227,8 +227,11 @@ func (c *Conn) awaitAck() error {
 	if err != nil {
 		return fmt.Errorf("read server acknowledgement: %w", err)
 	}
-	if len(ack) != 1 || ack[0] != helloVersion {
+	if len(ack) != 1 {
 		return errors.New("unexpected server acknowledgement")
+	}
+	if ack[0] != helloVersion {
+		return fmt.Errorf("server speaks protocol version %d, this client speaks %d", ack[0], helloVersion)
 	}
 	c.acked.Store(true)
 	return nil
