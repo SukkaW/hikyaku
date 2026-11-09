@@ -35,20 +35,23 @@ func (r *burstReader) Read(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func checkStages(t *testing.T, sizes []int) {
+func checkRamp(t *testing.T, sizes []int) {
 	t.Helper()
-	if len(sizes) <= 2*drsThreshold {
-		t.Fatalf("only %d frames written", len(sizes))
-	}
 	reachedMax := false
 	for i, size := range sizes {
-		if limit := drsFrameSize(i); size > limit {
-			t.Fatalf("frame %d is %d bytes, over the %d-byte limit for its stage", i, size, limit)
+		if limit := min(drsFirst+i*drsSegment, maxFramePayload); size > limit {
+			t.Fatalf("frame %d is %d bytes, over its %d-byte limit", i, size, limit)
 		}
 		reachedMax = reachedMax || size == maxFramePayload
 	}
 	if !reachedMax {
 		t.Fatal("frame size never grew to the maximum")
+	}
+	// The first read fills all four, so each is exactly as many segments as its position.
+	for i := range 4 {
+		if want := (i+1)*drsSegment - 42; sizes[i] != want {
+			t.Fatalf("frame %d is %d bytes, want %d", i, sizes[i], want)
+		}
 	}
 }
 
@@ -57,7 +60,7 @@ func TestDRSFrameSizes(t *testing.T) {
 	if err := copyDRS(w, &burstReader{total: 40, pauseAt: -1}); err != nil {
 		t.Fatal(err)
 	}
-	checkStages(t, w.sizes)
+	checkRamp(t, w.sizes)
 }
 
 func TestDRSResetsAfterIdle(t *testing.T) {
@@ -72,9 +75,6 @@ func TestDRSResetsAfterIdle(t *testing.T) {
 		written += w.sizes[idx]
 		idx++
 	}
-	checkStages(t, w.sizes[:idx])
-	checkStages(t, w.sizes[idx:])
-	if w.sizes[idx] != drsLow {
-		t.Fatalf("first frame after idle is %d bytes, want %d", w.sizes[idx], drsLow)
-	}
+	checkRamp(t, w.sizes[:idx])
+	checkRamp(t, w.sizes[idx:])
 }

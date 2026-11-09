@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-// Dynamic record sizing, after Cloudflare's nginx patch: the first frames of a burst
-// fit one TCP segment so the receiver can use them without waiting for the rest.
+// Dynamic record sizing, after Cloudflare's nginx patch: a burst starts with a frame
+// that fits one TCP segment and each later frame is one segment larger, so the
+// receiver can use what has arrived without waiting for the rest.
 // Each frame costs 42 bytes (34 for the chunk, 8 for the smux header).
 const (
-	drsLow       = 1388 // (1500 - 40 IPv6 - 20 TCP - 10 timestamps) - 42
-	drsHigh      = 4248 // 3 × 1430 - 42
-	drsThreshold = 40
+	drsSegment   = 1428 // 1500 - 40 IPv6 - 20 TCP - 12 for timestamps as sent; IPv4 segments are larger
+	drsFirst     = drsSegment - 42
 	drsIdleReset = time.Second
 )
 
@@ -40,16 +40,16 @@ func Relay(local, stream net.Conn) {
 
 func copyDRS(dst io.Writer, src io.Reader) error {
 	buf := make([]byte, maxFramePayload)
-	var frames int
+	limit := drsFirst
 	var lastWrite time.Time
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
 			if time.Since(lastWrite) > drsIdleReset {
-				frames = 0
+				limit = drsFirst
 			}
-			for p := buf[:n]; len(p) > 0; frames++ {
-				size := min(len(p), drsFrameSize(frames))
+			for p := buf[:n]; len(p) > 0; limit = min(limit+drsSegment, maxFramePayload) {
+				size := min(len(p), limit)
 				if _, err := dst.Write(p[:size]); err != nil {
 					return err
 				}
@@ -63,16 +63,5 @@ func copyDRS(dst io.Writer, src io.Reader) error {
 		if err != nil {
 			return err
 		}
-	}
-}
-
-func drsFrameSize(frames int) int {
-	switch {
-	case frames < drsThreshold:
-		return drsLow
-	case frames < 2*drsThreshold:
-		return drsHigh
-	default:
-		return maxFramePayload
 	}
 }
