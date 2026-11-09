@@ -64,6 +64,17 @@ func newPool(server string, psk []byte, carriers int) *pool {
 	return &pool{server: server, psk: psk, carriers: make([]*carrier, carriers)}
 }
 
+// warm opens the first carrier before any request, so one that arrives a round trip
+// later finds it connected. Requests that arrive sooner wait for it as before and
+// still ride its first flight.
+func (p *pool) warm() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.opened == 0 {
+		p.grow()
+	}
+}
+
 // grow starts maintaining one more slot; the caller holds p.mu.
 func (p *pool) grow() {
 	if p.opened < len(p.carriers) {

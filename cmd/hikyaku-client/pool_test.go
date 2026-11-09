@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -29,6 +30,41 @@ func TestPoolKeepsSpare(t *testing.T) {
 	if opened != 2 {
 		t.Fatalf("opened %d slots, want 2: one busy carrier and one spare", opened)
 	}
+}
+
+func TestPoolWarm(t *testing.T) {
+	psk := "warm-pool-test"
+	p := newPool(startServer(t, psk), []byte(psk), 4)
+	p.warm()
+	waitFor(t, "the first carrier acknowledged without any request", func() bool { return p.acked() == 1 })
+	p.mu.Lock()
+	opened := p.opened
+	p.mu.Unlock()
+	if opened != 1 {
+		t.Fatalf("opened %d slots, want 1", opened)
+	}
+}
+
+// A burst that arrives while the first carrier is still connecting, as when Surge
+// starts the client and sends requests at once, waits for it instead of failing.
+func TestPoolWarmBurst(t *testing.T) {
+	psk := "warm-burst-test"
+	p := newPool(startServer(t, psk), []byte(psk), 4)
+	p.warm()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, s, err := p.openStream()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			s.Close()
+		}()
+	}
+	wg.Wait()
 }
 
 func (p *pool) acked() int {

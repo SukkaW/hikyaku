@@ -27,6 +27,8 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("SOCKS5 listening on %s", ln.Addr())
-	h := &inbound{pool: newPool(*server, []byte(*psk), *carriers)}
+	p := newPool(*server, []byte(*psk), *carriers)
+	p.warm()
+	h := &inbound{pool: p}
 	log.Fatal(h.serve(ln))
 }
