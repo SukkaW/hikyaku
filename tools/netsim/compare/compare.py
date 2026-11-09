@@ -61,6 +61,10 @@ CARRIER_EVENTS = {"slow": "slower than", "pong overdue": "pong overdue", "silent
                   "no acknowledgement": "no acknowledgement", "link probing": "probing"}
 SMALL = "https://localhost:9443/"
 BIG = "http://localhost:9001/big?n={}"
+# A 100 KB page fetched after the user has been reading for a while: the carrier is
+# warm but idle, so the server's TCP may have shrunk its congestion window.
+AFTER_IDLE_URL = "https://localhost:9443/big?n=100000"
+AFTER_IDLE_S = 5
 BULK_SECONDS = 8
 BULK_LIMIT_S = 20
 QUICK_BULK_LIMIT_S = 6
@@ -79,7 +83,10 @@ class Run:
         self.profile, self.system, self.instance = profile, system, instance
         suffix = f"-{instance}" if instance else ""
         self.client_ns, self.server_ns = f"hk-client{suffix}", f"hk-server{suffix}"
+        self.client = f"10.200.{instance}.1"
         self.server = f"10.200.{instance}.2"
+        self.client_dev = f"hkc{instance}" if instance else "hkc"
+        self.server_dev = f"hks{instance}" if instance else "hks"
         self.procs = []
 
     def path(self, name):
@@ -133,6 +140,25 @@ def curl(run, socks, url, max_time):
     seconds = float(parts[0]) if parts else None
     size = int(float(parts[1])) if len(parts) > 1 else 0
     return r.returncode == 0, seconds, size
+
+
+def first_byte(run, socks, url, max_time):
+    """Fetch url and return whether it worked, the time to first byte and the total."""
+    cmd = ["ip", "netns", "exec", run.client_ns, "curl", "-sS", "-o", "/dev/null", "-w",
+           "%{time_starttransfer} %{time_total}", "--max-time", str(max_time), "--cacert",
+           os.path.join(opts.certs, "ca.pem"), "--socks5-hostname", socks, url]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=ENV, timeout=max_time + 15)
+    parts = r.stdout.split()
+    if r.returncode != 0 or len(parts) != 2:
+        return False, None, None
+    return True, float(parts[0]), float(parts[1])
+
+
+def after_idle(run, socks, result):
+    time.sleep(AFTER_IDLE_S)
+    ok, ttfb, total = first_byte(run, socks, AFTER_IDLE_URL, 30)
+    result["after_idle_ttfb_s"] = round(ttfb, 3) if ok else None
+    result["after_idle_s"] = round(total, 3) if ok else None
 
 
 def certs():
@@ -231,6 +257,7 @@ def measure(run, start_client, socks, size):
         loaded_times = [s for ok, s, _ in loaded if ok]
         result["loaded_median_s"] = round(statistics.median(loaded_times), 3) if loaded_times else None
         result["loaded_failures"] = sum(1 for ok, _, _ in loaded if not ok)
+        after_idle(run, socks, result)
         return result
 
     # Throughput is bytes over time, so a download that hits the limit still counts.
@@ -253,6 +280,7 @@ def measure(run, start_client, socks, size):
     loaded_times = [s for ok, s, _ in loaded if ok]
     result["loaded_median_s"] = round(statistics.median(loaded_times), 3) if loaded_times else None
     result["loaded_failures"] = sum(1 for ok, _, _ in loaded if not ok)
+    after_idle(run, socks, result)
     return result
 
 
@@ -260,6 +288,15 @@ def execute(run, netsim_args, size):
     try:
         spawn(run, [opts.netsim, "-id", str(run.instance), *netsim_args], "netsim")
         wait_for(run, "netsim", "ready", 10)
+        # Server TCP settings under test apply to this run's server namespace only.
+        for setting in opts.server_sysctl:
+            subprocess.run(["ip", "netns", "exec", run.server_ns, "sysctl", "-qw", setting], check=True)
+        if opts.initcwnd:
+            # The client must also advertise a window that large, as macOS does by default.
+            subprocess.run(["ip", "-n", run.server_ns, "route", "change", run.client, "dev", run.server_dev,
+                            "initcwnd", str(opts.initcwnd)], check=True)
+            subprocess.run(["ip", "-n", run.client_ns, "route", "change", run.server, "dev", run.client_dev,
+                            "initrwnd", str(opts.initcwnd)], check=True)
         spawn(run, ["python3", os.path.join(HERE, "origin.py"), os.path.join(opts.certs, "leaf.pem"),
                     os.path.join(opts.certs, "leaf.key")], "origin", "server")
         wait_for(run, "origin", "origin ready", 10)
@@ -277,14 +314,16 @@ def execute(run, netsim_args, size):
 
 
 def table(results):
-    head = "| Profile | System | Cold start | 6-way burst | Download | Small fetch during download | Failures |"
-    lines = [head, "|" + "---|" * 7]
+    head = ("| Profile | System | Cold start | 6-way burst | Download | Small fetch during download "
+            "| 100 KB after 5 s idle (first byte / total) | Failures |")
+    lines = [head, "|" + "---|" * 8]
     fmt = lambda v, unit="s": "fail" if v is None else f"{v} {unit}"
     for profile, systems in results.items():
         for system, r in systems.items():
             failures = r["burst_failures"] + r["loaded_failures"]
             lines.append(f"| {profile} | {system} | {fmt(r['cold_s'])} | {fmt(r['burst_max_s'])} | {r['bulk_mbps']} Mbit/s "
-                         f"({r['bulk_mb']} MB) | {fmt(r['loaded_median_s'])} | {failures} |")
+                         f"({r['bulk_mb']} MB) | {fmt(r['loaded_median_s'])} "
+                         f"| {fmt(r['after_idle_ttfb_s'])} / {fmt(r['after_idle_s'])} | {failures} |")
     return "\n".join(lines)
 
 
@@ -301,6 +340,9 @@ def main():
     ap.add_argument("--systems", default=",".join(SYSTEMS))
     ap.add_argument("--sequential", action="store_true", help="run one system and profile at a time")
     ap.add_argument("--quick", action="store_true", help="fewer samples, about 15 s per GEO run, for prototyping")
+    ap.add_argument("--server-sysctl", action="append", default=[], metavar="KEY=VALUE",
+                    help="sysctl to set in each server namespace, e.g. net.ipv4.tcp_slow_start_after_idle=0")
+    ap.add_argument("--initcwnd", type=int, default=0, help="initial congestion window for server-to-client routes")
     opts = ap.parse_args()
     os.makedirs(opts.out, exist_ok=True)
     certs()
