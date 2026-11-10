@@ -55,15 +55,21 @@ archives:
         formats:
           - zip
 
+release:
+  prerelease: auto
+
 brews:
   - name: hikyaku
     repository:
       owner: SukkaW
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    commit_author:
+      name: SukkaBot
+      email: "{{ .Env.HOMEBREW_GIT_MAIL }}"
     directory: Formula
     homepage: https://github.com/SukkaW/hikyaku
-    description: High-performance multiplexing proxy that stays lightning fast and highly reliable everywhere, from fiber broadband to lossy in-flight Wi-Fi
+    description: A high-performance multiplexing proxy that stays lightning fast and highly reliable everywhere,<br />from fiber broadband to lossy in-flight Wi-Fi.
     license: MIT
     install: |
       bin.install "hikyaku-server"
