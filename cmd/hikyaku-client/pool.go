@@ -353,8 +353,14 @@ func (c *carrier) unresponsive(d time.Duration) bool {
 	return c.pongOverdue(d) && time.Since(c.conn.LastData()) >= d
 }
 
+// ackOverdue reports whether a stream has waited past c's reply deadline for its
+// acknowledgement while no data arrived for as long either; like a pong, an
+// acknowledgement can wait behind a busy carrier's own queue.
 func (c *carrier) ackOverdue() bool {
 	d := c.replyDeadline()
+	if time.Since(c.conn.LastData()) < d {
+		return false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, opened := range c.waiting {

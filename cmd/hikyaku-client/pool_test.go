@@ -328,17 +328,15 @@ func TestDataKeepsCarrierAlive(t *testing.T) {
 	}), []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
-	p.mu.Lock()
-	c := p.carriers[0]
-	p.mu.Unlock()
-	// Opened on the session itself, so no acknowledgement is awaited on it.
-	if _, err := c.session.OpenStream(); err != nil {
+	// Opened through the pool, so its acknowledgement is awaited as well.
+	if _, _, err := p.openStream(); err != nil {
 		t.Fatal(err)
 	}
-	// The server answers no pings but keeps sending data, which proves it alive.
+	// The server answers no pings and acknowledges no stream but keeps sending data,
+	// which proves it alive.
 	time.Sleep(maxReplyDeadline + 2*healthCheck + time.Second)
 	if len(p.standing()) != 0 {
-		t.Fatal("a carrier still delivering data stood by because its pings went unanswered")
+		t.Fatal("a carrier still delivering data stood by because its pings or acknowledgement went unanswered")
 	}
 	close(stop)
 	deadline := time.Now().Add(maxReplyDeadline + 3*time.Second)
