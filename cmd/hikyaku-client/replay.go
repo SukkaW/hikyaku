@@ -168,7 +168,10 @@ func (r *replayStream) replayLocked(s *carrierStream) bool {
 	}
 	r.replays++
 	c.untrack(r)
-	s.Close()
+	if !r.moving.Load() {
+		// abandon closes a moving stream itself, after its RESET.
+		s.Close()
+	}
 	if err := r.attach(); err != nil {
 		return false
 	}
@@ -207,10 +210,17 @@ func (r *replayStream) stopReplay() {
 }
 
 // abandon moves an unanswered replayable stream off a carrier that went silent.
+// The read deadline wakes the stream's reader to move now; the old stream is reset
+// before its FIN, off the pool's path, as the carrier's writes may be stuck.
 func (r *replayStream) abandon(c *carrier) {
 	if r.carrier.Load() == c && r.replayable.Load() && !r.answered.Load() {
 		r.moving.Store(true)
-		r.stream.Load().Close()
+		s := r.stream.Load()
+		s.SetReadDeadline(time.Now())
+		go func() {
+			s.Abort()
+			s.Close()
+		}()
 	}
 }
 

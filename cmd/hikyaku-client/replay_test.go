@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
+	"github.com/xtaci/smux"
 )
 
 // stallingOrigin never answers its first connection and answers "ok" on later ones,
@@ -191,4 +192,75 @@ func TestCutOffResponseIsReset(t *testing.T) {
 	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("read after the carrier died: %v, want a reset rather than a clean end", err)
 	}
+}
+
+// A stream moved off a carrier is reset before its FIN reaches the server, so the
+// server aborts the destination connection instead of half-closing it.
+func TestAbandonResetsStream(t *testing.T) {
+	psk := []byte("abandon-test")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	type event struct {
+		reset bool
+		id    uint32
+	}
+	events := make(chan event, 8)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		t.Cleanup(func() { conn.Close() })
+		c, err := proxy.ServerHandshake(conn, psk, proxy.NewReplayFilter())
+		if err != nil {
+			return
+		}
+		c.OnControl(func(cmd byte, body []byte) {
+			if id, _, ok := proxy.ParseReset(body); cmd == proxy.CtrlReset && ok {
+				events <- event{reset: true, id: id}
+			}
+		})
+		session, err := smux.Server(c, proxy.MuxConfig())
+		if err != nil {
+			return
+		}
+		for {
+			s, err := session.AcceptStream()
+			if err != nil {
+				return
+			}
+			// Never answered, so the stream stays replayable.
+			go func() {
+				io.Copy(io.Discard, s)
+				events <- event{id: s.ID()}
+			}()
+		}
+	}()
+	p := newPool(ln.Addr().String(), psk, 1)
+	p.warm()
+	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
+	r, err := newReplayStream(&inbound{pool: p}, proxy.Addr{Domain: "example.com", Port: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	old := r.stream.Load()
+	go r.Read(make([]byte, 1))
+	r.carrier.Load().moveUnanswered()
+	for _, want := range []event{{reset: true, id: old.ID()}, {id: old.ID()}} {
+		select {
+		case got := <-events:
+			if got != want {
+				t.Fatalf("server saw %+v, want %+v: the moved stream's RESET before its FIN", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("server never saw %+v for the moved stream", want)
+		}
+	}
+	waitFor(t, "the stream to move", func() bool { return r.stream.Load() != old })
 }
