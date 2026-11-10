@@ -127,7 +127,10 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 			}
 			client.Store(from)
 			idle = udpIdle(idle, d.DstAddr.Port)
-			if proxy.WritePacket(stream, toAddr(d.DstAddr), d.Data) != nil {
+			if err := proxy.WritePacket(stream, toAddr(d.DstAddr), d.Data); err != nil {
+				if errors.Is(err, proxy.ErrBadPacket) {
+					continue
+				}
 				return
 			}
 		}
@@ -137,6 +140,9 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 		buf := make([]byte, proxy.MaxPacket)
 		for {
 			source, payload, err := proxy.ReadPacket(stream, buf)
+			if errors.Is(err, proxy.ErrBadPacket) {
+				continue
+			}
 			if err != nil {
 				var failed *proxy.ResultError
 				if errors.As(err, &failed) {

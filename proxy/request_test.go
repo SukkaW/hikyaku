@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net/netip"
 	"strings"
 	"testing"
@@ -98,5 +99,48 @@ func TestMalformedInput(t *testing.T) {
 		if err := read(); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestBadPackets(t *testing.T) {
+	buf := make([]byte, MaxPacket)
+	cases := map[string]func() error{
+		"empty frame": func() error {
+			_, _, err := ReadPacket(bytes.NewReader([]byte{0, 0}), buf)
+			return err
+		},
+		"unknown address type": func() error {
+			_, _, err := ReadPacket(bytes.NewReader([]byte{0, 1, 9}), buf)
+			return err
+		},
+		"truncated address": func() error {
+			_, _, err := ReadPacket(bytes.NewReader([]byte{0, 2, addrIPv4, 1}), buf)
+			return err
+		},
+		"address with no IP or domain": func() error {
+			return WritePacket(io.Discard, Addr{Port: 53}, []byte("query"))
+		},
+		"too large with its address": func() error {
+			return WritePacket(io.Discard, Addr{IP: netip.IPv6Loopback(), Port: 53}, make([]byte, MaxPacket))
+		},
+	}
+	for name, run := range cases {
+		if err := run(); !errors.Is(err, ErrBadPacket) {
+			t.Errorf("%s: %v, want ErrBadPacket", name, err)
+		}
+	}
+
+	// A bad frame is skipped whole, so the next one still decodes.
+	var b bytes.Buffer
+	b.Write([]byte{0, 1, 9})
+	want := Addr{IP: netip.MustParseAddr("192.0.2.1"), Port: 53}
+	if err := WritePacket(&b, want, []byte("next")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReadPacket(&b, buf); !errors.Is(err, ErrBadPacket) {
+		t.Fatalf("bad frame: %v, want ErrBadPacket", err)
+	}
+	if got, payload, err := ReadPacket(&b, buf); err != nil || got != want || string(payload) != "next" {
+		t.Fatalf("frame after a bad one read as %s %q, %v", got, payload, err)
 	}
 }

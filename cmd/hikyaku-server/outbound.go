@@ -123,7 +123,12 @@ func (o *outbound) relayUDP(stream net.Conn) {
 				return
 			}
 			source := proxy.Addr{IP: from.Addr().Unmap(), Port: from.Port()}
-			if proxy.WritePacket(stream, source, buf[:n]) != nil {
+			if err := proxy.WritePacket(stream, source, buf[:n]); err != nil {
+				// Anyone can send to this socket, so one unsendable datagram must not end
+				// the association.
+				if errors.Is(err, proxy.ErrBadPacket) {
+					continue
+				}
 				return
 			}
 		}
@@ -133,6 +138,9 @@ func (o *outbound) relayUDP(stream net.Conn) {
 	buf := make([]byte, proxy.MaxPacket)
 	for {
 		dst, payload, err := proxy.ReadPacket(stream, buf)
+		if errors.Is(err, proxy.ErrBadPacket) {
+			continue
+		}
 		if err != nil {
 			return
 		}

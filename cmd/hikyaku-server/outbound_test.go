@@ -193,6 +193,21 @@ func TestUDPTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("bad packet skipped", func(t *testing.T) {
+		stream := openStream(t, true, proxy.UDPRequest)
+		readReplies(t, stream)
+		if _, err := stream.Write([]byte{0, 1, 9}); err != nil {
+			t.Fatal(err)
+		}
+		echoAddr := addrOf(t, echo.LocalAddr())
+		if err := proxy.WritePacket(stream, echoAddr, []byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		stream.SetReadDeadline(time.Now().Add(time.Second))
+		if _, payload, err := proxy.ReadPacket(stream, make([]byte, proxy.MaxPacket)); err != nil || string(payload) != "ping" {
+			t.Fatalf("echo after a bad packet: %q, %v; want the association to carry on", payload, err)
+		}
+	})
 }
 
 func TestResultCode(t *testing.T) {

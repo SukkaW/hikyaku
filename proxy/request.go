@@ -56,8 +56,12 @@ const (
 // MaxPacket is the largest UDP packet, its address included, a UDP stream carries.
 const MaxPacket = 65535
 
+// ErrBadPacket is a UDP packet that cannot be encoded or decoded. The stream it was on
+// stays usable, so the packet is skipped rather than ending the association.
+var ErrBadPacket = errors.New("invalid UDP packet")
+
 var (
-	errPacketTooLarge = errors.New("UDP packet too large")
+	errPacketTooLarge = fmt.Errorf("%w: too large", ErrBadPacket)
 	errBadAddr        = errors.New("invalid address")
 	errBadAck         = errors.New("stream did not start with an acknowledgement")
 	errBadResult      = errors.New("stream did not report a result")
@@ -233,7 +237,7 @@ func ReadResult(r io.Reader) error {
 func WritePacket(w io.Writer, addr Addr, payload []byte) error {
 	b, err := appendAddr(make([]byte, 2, 2+1+1+255+2+len(payload)), addr)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrBadPacket, err)
 	}
 	b = append(b, payload...)
 	if len(b)-2 > MaxPacket {
@@ -252,13 +256,19 @@ func ReadPacket(r io.Reader, buf []byte) (Addr, []byte, error) {
 		return Addr{}, nil, err
 	}
 	n := int(binary.BigEndian.Uint16(size[:]))
+	if n == 0 {
+		return Addr{}, nil, fmt.Errorf("%w: empty", ErrBadPacket)
+	}
 	if _, err := io.ReadFull(r, buf[:n]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return Addr{}, nil, err
 	}
 	packet := bytes.NewReader(buf[:n])
 	addr, err := readAddr(packet)
 	if err != nil {
-		return Addr{}, nil, err
+		return Addr{}, nil, fmt.Errorf("%w: %v", ErrBadPacket, err)
 	}
 	return addr, buf[n-packet.Len() : n], nil
 }
