@@ -74,8 +74,8 @@ func (h *inbound) connect(_ context.Context, writer io.Writer, request *socks5.R
 
 // associate relays a SOCKS5 UDP association over one udp-over-tcp stream. It lasts
 // as long as the client's control connection (RFC 1928 section 7), or until no
-// packet has come from the client for its idle timeout (see udpIdle), and udpTimeout
-// before its first packet.
+// packet has passed in either direction for its idle timeout (see udpIdle), and
+// udpTimeout before its first packet.
 func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5.Request) error {
 	conn, ok := writer.(net.Conn)
 	if !ok {
@@ -108,13 +108,21 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 	}
 
 	var client atomic.Pointer[net.UDPAddr]
+	var active atomic.Int64 // unix nanoseconds of the last packet either way
+	active.Store(time.Now().UnixNano())
 	go func() {
 		defer conn.Close()
 		buf := make([]byte, proxy.MaxPacket)
 		var idle time.Duration
 		for {
-			udp.SetReadDeadline(time.Now().Add(cmp.Or(idle, udpTimeout)))
+			timeout := cmp.Or(idle, udpTimeout)
+			udp.SetReadDeadline(time.Unix(0, active.Load()).Add(timeout))
 			n, from, err := udp.ReadFromUDP(buf)
+			// A reply that arrived meanwhile moved the deadline on.
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() && time.Since(time.Unix(0, active.Load())) < timeout {
+				continue
+			}
 			if err != nil {
 				return
 			}
@@ -126,6 +134,7 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 				continue
 			}
 			client.Store(from)
+			active.Store(time.Now().UnixNano())
 			idle = udpIdle(idle, d.DstAddr.Port)
 			if err := proxy.WritePacket(stream, toAddr(d.DstAddr), d.Data); err != nil {
 				if errors.Is(err, proxy.ErrBadPacket) {
@@ -152,7 +161,9 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 			}
 			if to := client.Load(); to != nil {
 				reply := statute.Datagram{DstAddr: toSpec(source), Data: payload}
-				udp.WriteToUDP(reply.Bytes(), to)
+				if _, err := udp.WriteToUDP(reply.Bytes(), to); err == nil {
+					active.Store(time.Now().UnixNano())
+				}
 			}
 		}
 	}()

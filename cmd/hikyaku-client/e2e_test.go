@@ -369,3 +369,64 @@ func TestUDPIdle(t *testing.T) {
 		}
 	}
 }
+
+// An app that only listens, as to a server pushing updates, keeps its association
+// while replies arrive; once both directions go quiet, it still closes.
+func TestUDPIdleCountsReplies(t *testing.T) {
+	origin, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer origin.Close()
+	// Set before the client starts, which reads it, and left in place for the same
+	// reason.
+	udpTimeouts[origin.LocalAddr().(*net.UDPAddr).Port] = time.Second
+	go func() {
+		buf := make([]byte, 1500)
+		_, addr, err := origin.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+			origin.WriteTo([]byte("update"), addr)
+		}
+	}()
+	key := make([]byte, proxy.PSKSize)
+	rand.Read(key)
+	psk := base64.StdEncoding.EncodeToString(key)
+	client := startClient(t, startServer(t, psk), []byte(psk))
+
+	control, relay, err := client.associate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	pc, err := net.DialUDP("udp", nil, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	datagram, err := statute.NewDatagram(origin.LocalAddr().String(), []byte("subscribe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pc.Write(datagram.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	var last time.Duration
+	for buf := make([]byte, 64); ; {
+		pc.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := pc.Read(buf); err != nil {
+			break
+		}
+		last = time.Since(start)
+	}
+	if last < 2*time.Second {
+		t.Fatalf("last update arrived %v after the app's only packet; want updates past the 1 s idle timeout", last)
+	}
+	control.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := control.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("control connection read %v; want the association closed once both directions went quiet", err)
+	}
+}
