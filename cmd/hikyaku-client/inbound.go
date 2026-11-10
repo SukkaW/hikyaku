@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -16,6 +17,15 @@ import (
 )
 
 const udpTimeout = 5 * time.Minute
+
+// udpTimeouts are sing-box's default UDP timeouts for the protocols it recognizes by
+// port. Other ports keep udpTimeout.
+var udpTimeouts = map[int]time.Duration{
+	53:   10 * time.Second, // DNS
+	123:  10 * time.Second, // NTP
+	3478: 10 * time.Second, // STUN
+	443:  30 * time.Second, // QUIC
+}
 
 var errNotConn = errors.New("SOCKS5 writer is not a connection")
 
@@ -64,7 +74,8 @@ func (h *inbound) connect(_ context.Context, writer io.Writer, request *socks5.R
 
 // associate relays a SOCKS5 UDP association over one udp-over-tcp stream. It lasts
 // as long as the client's control connection (RFC 1928 section 7), or until no
-// packet has come from the client for udpTimeout.
+// packet has come from the client for its idle timeout (see udpIdle), and udpTimeout
+// before its first packet.
 func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5.Request) error {
 	conn, ok := writer.(net.Conn)
 	if !ok {
@@ -100,8 +111,9 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 	go func() {
 		defer conn.Close()
 		buf := make([]byte, proxy.MaxPacket)
+		var idle time.Duration
 		for {
-			udp.SetReadDeadline(time.Now().Add(udpTimeout))
+			udp.SetReadDeadline(time.Now().Add(cmp.Or(idle, udpTimeout)))
 			n, from, err := udp.ReadFromUDP(buf)
 			if err != nil {
 				return
@@ -114,6 +126,7 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 				continue
 			}
 			client.Store(from)
+			idle = udpIdle(idle, d.DstAddr.Port)
 			if proxy.WritePacket(stream, toAddr(d.DstAddr), d.Data) != nil {
 				return
 			}
@@ -139,6 +152,17 @@ func (h *inbound) associate(_ context.Context, writer io.Writer, request *socks5
 	}()
 	io.Copy(io.Discard, request.Reader)
 	return nil
+}
+
+// udpIdle returns an association's idle timeout once it has also sent to port, given
+// its timeout so far (0 before its first packet). One association can carry packets to
+// many destinations, so it keeps the longest timeout among them.
+func udpIdle(current time.Duration, port int) time.Duration {
+	timeout, ok := udpTimeouts[port]
+	if !ok {
+		timeout = udpTimeout
+	}
+	return max(current, timeout)
 }
 
 func toAddr(spec statute.AddrSpec) proxy.Addr {

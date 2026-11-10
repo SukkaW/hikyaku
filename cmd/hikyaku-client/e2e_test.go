@@ -195,3 +195,28 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 }
+
+func TestUDPIdle(t *testing.T) {
+	cases := []struct {
+		name  string
+		ports []int
+		want  time.Duration
+	}{
+		{"DNS only", []int{53, 53}, 10 * time.Second},
+		{"DNS and NTP", []int{53, 123}, 10 * time.Second},
+		{"STUN", []int{3478}, 10 * time.Second},
+		{"DNS, then QUIC", []int{53, 443}, 30 * time.Second},
+		{"QUIC, then DNS", []int{443, 53}, 30 * time.Second},
+		{"DNS, then an unrecognized port", []int{53, 8080}, udpTimeout},
+		{"an unrecognized port, then DNS", []int{8080, 53}, udpTimeout},
+	}
+	for _, c := range cases {
+		var idle time.Duration
+		for _, port := range c.ports {
+			idle = udpIdle(idle, port)
+		}
+		if idle != c.want {
+			t.Errorf("%s: %s, want %s", c.name, idle, c.want)
+		}
+	}
+}
