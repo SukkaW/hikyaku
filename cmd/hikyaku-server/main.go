@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -233,6 +234,16 @@ func (s *resettable) Abort() {
 func (s *resettable) Read(b []byte) (int, error) {
 	n, err := s.Stream.Read(b)
 	if err != nil && s.reset.Load() {
+		err = proxy.ErrReset
+	}
+	return n, err
+}
+
+// WriteTo keeps smux's copy loop, which io.Copy uses instead of Read and which ends
+// cleanly at a FIN, but reports a reset the way Read does.
+func (s *resettable) WriteTo(w io.Writer) (int64, error) {
+	n, err := s.Stream.WriteTo(w)
+	if s.reset.Load() {
 		err = proxy.ErrReset
 	}
 	return n, err
