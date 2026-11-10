@@ -1,0 +1,5 @@
+98f5e4f439883b806c211acacca63abf8eb1c1748f4179098ad087e8ff404d04  satmux.py
+e2e357f3be41773ada13057a0ea2116b27e68abd200c76dda1c277bde18f6d92  tuic-client-aarch64-linux-musl
+ee5d5a55ab147b99f16c1e051247487d959df04ad8947097e285e4bde20e39d1  tuic-client-x86_64-linux-musl
+96d29f947cdee07551c3b0a6af40e6a01bd334fd7dab8743668c8364978da640  tuic-server-aarch64-linux-musl
+d2c76a3bd4fbd32b209d4f29bbf76dcb80b4c7d25ae8ef1a8b5130e0364c498a  tuic-server-x86_64-linux-musl

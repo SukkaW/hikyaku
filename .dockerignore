@@ -1,0 +1,3 @@
+# tools/netsim/Dockerfile builds from the repository root; leave out history and results.
+.git
+netsim-out
