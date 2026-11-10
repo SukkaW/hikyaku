@@ -139,7 +139,6 @@ func (p *pool) maintain(slot int) {
 			time.Sleep(backoff)
 			continue
 		}
-		backoff = 0
 		c.slot = slot
 		p.set(slot, c)
 		log.Printf("carrier %d: ready", slot)
@@ -175,6 +174,14 @@ func (p *pool) maintain(slot int) {
 		default:
 			p.set(slot, nil)
 			log.Printf("carrier %d: closed after %s: %s", slot, c.lifetime(), c.closeReason())
+		}
+		// With 0-RTT a dial succeeds before the server answers, so a carrier it never
+		// acknowledged, such as one with the wrong PSK, counts as a failed dial.
+		if c.conn.Acked() {
+			backoff = 0
+		} else {
+			backoff = min(max(2*backoff, minBackoff), maxBackoff)
+			time.Sleep(backoff)
 		}
 	}
 }

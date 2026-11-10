@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -423,6 +424,34 @@ func TestGoAwayStandsBy(t *testing.T) {
 	waitFor(t, "the carrier to stand by", func() bool { return len(p.standing()) > 0 })
 	if reason := p.standing()[0].goaway.Load(); reason == nil || *reason != "test" {
 		t.Fatalf("standby carrier's GOAWAY reason %v, want the server's", reason)
+	}
+}
+
+// A server that closes every carrier before acknowledging it, as for a client with the
+// wrong PSK, gets backed-off redials instead of a dial every health check.
+func TestRejectedCarriersBackOff(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var accepted atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			conn.Close()
+		}
+	}()
+	p := newPool(ln.Addr().String(), []byte("wrong-psk"), 1)
+	p.warm()
+	time.Sleep(5 * time.Second)
+	// Backing off 1, 2 and 4 s after each rejection allows about three dials in 5 s.
+	if n := accepted.Load(); n > 4 {
+		t.Fatalf("%d carriers dialed in 5 s to a server that rejects them all, want at most 4", n)
 	}
 }
 
