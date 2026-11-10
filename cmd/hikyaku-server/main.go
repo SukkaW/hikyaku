@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -59,10 +60,15 @@ func main() {
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-signals
+		ln.Close()
 		goAway()
 		os.Exit(0)
 	}()
-	log.Fatal(serve(ln, []byte(*psk), newOutbound()))
+	if err := serve(ln, []byte(*psk), newOutbound()); !errors.Is(err, net.ErrClosed) {
+		log.Fatal(err)
+	}
+	// The listener closed on a signal; the handler exits once carriers have gone away.
+	select {}
 }
 
 // goAway tells every client its carriers are going away, then gives their streams up

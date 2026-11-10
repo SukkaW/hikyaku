@@ -454,13 +454,20 @@ func TestDroppedPingsKeepCarrier(t *testing.T) {
 
 func TestGoAwayStandsBy(t *testing.T) {
 	psk := "goaway-test"
+	var carriers atomic.Int32
 	p := newPool(fakeServer(t, psk, func(c *proxy.Conn, _ *smux.Session) {
+		carriers.Add(1)
 		c.WriteControl(proxy.CtrlGoAway, []byte{proxy.GoAwayShutdown, 4, 't', 'e', 's', 't'})
 	}), []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier to stand by", func() bool { return len(p.standing()) > 0 })
 	if reason := p.standing()[0].goaway.Load(); reason == nil || *reason != "test" {
 		t.Fatalf("standby carrier's GOAWAY reason %v, want the server's", reason)
+	}
+	// A server that is shutting down gets its successor's carrier after a back-off.
+	time.Sleep(500 * time.Millisecond)
+	if n := carriers.Load(); n != 1 {
+		t.Fatalf("%d carriers within 500 ms of GOAWAY, want 1", n)
 	}
 }
 
