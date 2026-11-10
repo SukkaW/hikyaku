@@ -65,7 +65,6 @@ const (
 	ResultNetUnreachable
 	ResultHostUnreachable
 	ResultTimeout
-	ResultBlocked
 	ResultServerError
 )
 
