@@ -151,7 +151,7 @@ func (r *replayStream) Read(b []byte) (int, error) {
 }
 
 // replayLocked moves to another carrier if s failed before any response arrived
-// because its carrier closed or went silent, and reports whether to carry on with
+// because its carrier is down or went silent, and reports whether to carry on with
 // the new stream. The caller holds r.mu.
 func (r *replayStream) replayLocked(s *carrierStream) bool {
 	if s != r.stream.Load() {
@@ -159,7 +159,7 @@ func (r *replayStream) replayLocked(s *carrierStream) bool {
 	}
 	c := r.carrier.Load()
 	if r.answered.Load() || !r.replayable.Load() || r.closed.Load() || r.replays >= maxReplays ||
-		!(c.session.IsClosed() || r.moving.Load()) {
+		!(c.down() || r.moving.Load()) {
 		return false
 	}
 	r.replays++

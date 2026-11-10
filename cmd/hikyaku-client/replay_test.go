@@ -56,7 +56,8 @@ func TestReplay(t *testing.T) {
 	psk := base64.StdEncoding.EncodeToString(key)
 	server := startServer(t, psk)
 
-	run := func(t *testing.T, firstFlight []byte) (net.Conn, <-chan []byte) {
+	closeSession := func(c *carrier) { c.session.Close() }
+	run := func(t *testing.T, firstFlight []byte, kill func(*carrier)) (net.Conn, <-chan []byte) {
 		p := newPool(server, []byte(psk), 2)
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -92,14 +93,28 @@ func TestReplay(t *testing.T) {
 		if busy == nil {
 			t.Fatal("no carrier holds the stream")
 		}
-		busy.session.Close()
+		kill(busy)
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		return conn, received
 	}
 
 	t.Run("TLS stream moves to another carrier", func(t *testing.T) {
 		hello := []byte{0x16, 0x03, 0x01, 0x00, 0x04, 'p', 'i', 'n', 'g'}
-		conn, received := run(t, hello)
+		conn, received := run(t, hello, closeSession)
+		got := make([]byte, 2)
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "ok" {
+			t.Fatalf("read %q, %v; want the replayed stream's answer", got, err)
+		}
+		if again := <-received; !bytes.Equal(again, hello) {
+			t.Fatalf("replayed first flight %q, want %q", again, hello)
+		}
+	})
+
+	t.Run("TLS stream moves when its carrier's connection fails", func(t *testing.T) {
+		hello := []byte{0x16, 0x03, 0x01, 0x00, 0x04, 'p', 'i', 'n', 'g'}
+		// Only the TCP connection fails; smux leaves the session open until the pool's
+		// next health check.
+		conn, received := run(t, hello, func(c *carrier) { c.conn.Conn.Close() })
 		got := make([]byte, 2)
 		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "ok" {
 			t.Fatalf("read %q, %v; want the replayed stream's answer", got, err)
@@ -110,7 +125,7 @@ func TestReplay(t *testing.T) {
 	})
 
 	t.Run("plain stream is not replayed", func(t *testing.T) {
-		conn, received := run(t, []byte("GET /x\r\n\r"))
+		conn, received := run(t, []byte("GET /x\r\n\r"), closeSession)
 		if _, err := conn.Read(make([]byte, 2)); err == nil {
 			t.Fatal("plain stream survived its carrier")
 		}

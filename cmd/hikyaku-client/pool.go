@@ -243,6 +243,12 @@ func (c *carrier) closeReason() string {
 	return "closed"
 }
 
+// down reports whether c can carry no more streams. smux reports a failed connection
+// to its streams but leaves the session open until watch closes it.
+func (c *carrier) down() bool {
+	return c.session.IsClosed() || c.conn.ReadErr() != nil
+}
+
 // control handles the server's control messages on the carrier's reading goroutine.
 func (c *carrier) control(cmd byte, body []byte) {
 	switch cmd {
@@ -659,7 +665,7 @@ func (p *pool) spare(c *carrier) bool {
 func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 	var best *carrier
 	for _, c := range carriers {
-		if c == nil || c.session.IsClosed() || (eligible != nil && !eligible(c)) {
+		if c == nil || c.down() || (eligible != nil && !eligible(c)) {
 			continue
 		}
 		if best == nil || c.session.NumStreams() < best.session.NumStreams() {
@@ -677,7 +683,7 @@ func quickest(carriers []*carrier) *carrier {
 	var waits []time.Duration
 	var streams []int
 	for _, c := range carriers {
-		if c == nil || c.session.IsClosed() || !c.conn.Acked() {
+		if c == nil || c.down() || !c.conn.Acked() {
 			continue
 		}
 		acked = append(acked, c)
