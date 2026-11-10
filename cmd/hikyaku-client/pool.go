@@ -690,14 +690,14 @@ func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 }
 
 // quickest picks the acknowledged carrier where a new stream should hear back
-// soonest.
+// soonest, skipping any whose server is going away before watch moves it to standby.
 func quickest(carriers []*carrier) *carrier {
 	now := time.Now()
 	var acked []*carrier
 	var waits []time.Duration
 	var streams []int
 	for _, c := range carriers {
-		if c == nil || c.down() || !c.conn.Acked() {
+		if c == nil || c.down() || !c.conn.Acked() || c.goaway.Load() != nil {
 			continue
 		}
 		acked = append(acked, c)

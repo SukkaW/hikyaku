@@ -39,6 +39,43 @@ func TestPoolKeepsSpare(t *testing.T) {
 	}
 }
 
+func TestQuickestSkipsGoingAway(t *testing.T) {
+	psk := "goaway-pick-test"
+	p := newPool(startServer(t, psk), []byte(psk), 4)
+	_, first, err := p.openStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	waitFor(t, "first carrier acknowledged", func() bool { return p.acked() >= 1 })
+	_, second, err := p.openStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	waitFor(t, "two acknowledged carriers", func() bool { return p.acked() >= 2 })
+	p.mu.Lock()
+	carriers := append([]*carrier(nil), p.carriers...)
+	p.mu.Unlock()
+	// Between GOAWAY and the next health check the carrier is still in its slot; mark
+	// the one that would be picked.
+	going := quickest(carriers)
+	if going == nil {
+		t.Fatal("no carrier picked")
+	}
+	reason := "test"
+	going.goaway.Store(&reason)
+	for range 20 {
+		c := quickest(carriers)
+		if c == nil {
+			t.Fatal("picked no carrier, want the one whose server is not going away")
+		}
+		if c.goaway.Load() != nil {
+			t.Fatalf("picked carrier %d, whose server is going away", c.slot)
+		}
+	}
+}
+
 func TestPoolWarm(t *testing.T) {
 	psk := "warm-pool-test"
 	p := newPool(startServer(t, psk), []byte(psk), 4)
