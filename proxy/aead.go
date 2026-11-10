@@ -22,6 +22,9 @@ const (
 
 	saltSize = 32
 	maxChunk = 16 << 10
+	// readBuffer is the carrier's read buffer; a server allocates it only once the
+	// client's hello authenticates.
+	readBuffer = 64 << 10
 	// helloVersion is the wire protocol version; every format before the first
 	// release is 0, and numbering starts there.
 	helloVersion = 0
@@ -102,6 +105,7 @@ type Conn struct {
 // first Read; until then the PSK is unconfirmed.
 func ClientHandshake(conn net.Conn, psk []byte) (*Conn, error) {
 	c := newConn(conn)
+	c.r = bufio.NewReaderSize(conn, readBuffer)
 	c.psk = psk
 	c.clientSalt = make([]byte, saltSize)
 	rand.Read(c.clientSalt)
@@ -117,27 +121,28 @@ func ClientHandshake(conn net.Conn, psk []byte) (*Conn, error) {
 
 func ServerHandshake(conn net.Conn, psk []byte, replay *ReplayFilter) (*Conn, error) {
 	c := newConn(conn)
+	// Until the hello authenticates, read exactly what it takes straight from conn: a
+	// peer without the PSK then costs no buffers, and the client's early data behind
+	// the hello stays unread for the reader made afterwards.
 	clientSalt := make([]byte, saltSize)
-	if _, err := io.ReadFull(c.r, clientSalt); err != nil {
+	if _, err := io.ReadFull(conn, clientSalt); err != nil {
 		return nil, err
 	}
 	var err error
 	if c.open, err = newAEAD(psk, clientSalt, "hikyaku c2s"); err != nil {
 		return nil, err
 	}
-	hello, err := c.readChunk()
+	hello, err := c.readHello()
 	if err != nil {
 		return nil, fmt.Errorf("read client hello: %w", err)
-	}
-	if len(hello) != 1 {
-		return nil, errors.New("unexpected client hello")
 	}
 	if !replay.firstSeen(clientSalt, time.Now()) {
 		return nil, ErrReplay
 	}
+	c.r = bufio.NewReaderSize(conn, readBuffer)
 	// The hello names the newest version the client speaks; the server answers with
 	// the newest one both speak, which the client then accepts or gives up on.
-	version := min(hello[0], helloVersion)
+	version := min(hello, helloVersion)
 
 	serverSalt := make([]byte, saltSize)
 	rand.Read(serverSalt)
@@ -151,11 +156,39 @@ func ServerHandshake(conn net.Conn, psk []byte, replay *ReplayFilter) (*Conn, er
 }
 
 func newConn(conn net.Conn) *Conn {
-	c := &Conn{Conn: conn, r: bufio.NewReaderSize(conn, 64<<10)}
+	c := &Conn{Conn: conn}
 	// Counting from creation makes a carrier that never hears back look silent.
 	c.lastRead.Store(time.Now().UnixNano())
 	c.lastData.Store(c.lastRead.Load())
 	return c
+}
+
+// readHello reads the client's one-byte hello chunk with exact reads, before the
+// server has any buffers; see ServerHandshake.
+func (c *Conn) readHello() (byte, error) {
+	overhead := c.open.Overhead()
+	header := make([]byte, 2+overhead)
+	if _, err := io.ReadFull(c.Conn, header); err != nil {
+		return 0, err
+	}
+	length, err := c.open.Open(header[:0], c.openNonce[:], header, nil)
+	if err != nil {
+		return 0, err
+	}
+	increment(&c.openNonce)
+	if binary.BigEndian.Uint16(length) != 1 {
+		return 0, errors.New("unexpected client hello")
+	}
+	payload := make([]byte, 1+overhead)
+	if _, err := io.ReadFull(c.Conn, payload); err != nil {
+		return 0, err
+	}
+	hello, err := c.open.Open(payload[:0], c.openNonce[:], payload, nil)
+	if err != nil {
+		return 0, err
+	}
+	increment(&c.openNonce)
+	return hello[0], nil
 }
 
 func newAEAD(psk, salt []byte, info string) (cipher.AEAD, error) {

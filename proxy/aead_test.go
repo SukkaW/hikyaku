@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"errors"
@@ -153,6 +154,7 @@ func TestReplayedHelloRejected(t *testing.T) {
 // own, so a test can speak as another protocol version.
 func clientWithHello(conn net.Conn, psk, hello []byte) (*Conn, error) {
 	c := newConn(conn)
+	c.r = bufio.NewReaderSize(conn, readBuffer)
 	c.psk = psk
 	c.clientSalt = make([]byte, saltSize)
 	rand.Read(c.clientSalt)
