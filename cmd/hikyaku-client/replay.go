@@ -109,6 +109,8 @@ func (r *replayStream) Write(b []byte) (int, error) {
 		} else {
 			r.stopReplay()
 		}
+	} else {
+		r.sent = nil
 	}
 	s := r.stream.Load()
 	out := b
@@ -175,15 +177,18 @@ func (r *replayStream) replayLocked(s *carrierStream) bool {
 	return true
 }
 
+// markAnswered must not wait for r.mu: a Write blocked on a full window holds it, and
+// that Write may only drain once the app reads this response. The next Write drops
+// the replay buffer if r.mu is busy now.
 func (r *replayStream) markAnswered() {
-	if r.answered.Load() {
+	if r.answered.Swap(true) {
 		return
 	}
-	r.mu.Lock()
-	r.answered.Store(true)
-	r.sent = nil
 	r.carrier.Load().untrack(r)
-	r.mu.Unlock()
+	if r.mu.TryLock() {
+		r.sent = nil
+		r.mu.Unlock()
+	}
 }
 
 // stopReplay gives up on replaying once the app sends more than the buffer holds.

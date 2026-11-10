@@ -194,6 +194,45 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("udp echo %q from %s, %v; want ping from %s", reply.Data, reply.DstAddr.String(), err, echo.LocalAddr())
 		}
 	})
+
+	t.Run("answer while an upload is blocked", func(t *testing.T) {
+		origin, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer origin.Close()
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			conn, err := origin.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			// Answer without reading the upload, as a server that rejects it early does.
+			time.Sleep(time.Second)
+			conn.Write([]byte("ok"))
+			<-stop
+		}()
+		conn, err := client.DialContext(context.Background(), "tcp", origin.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		go func() {
+			chunk := make([]byte, 64<<10)
+			for range (128 << 20) / len(chunk) {
+				if _, err := conn.Write(chunk); err != nil {
+					return
+				}
+			}
+		}()
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		got := make([]byte, 2)
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "ok" {
+			t.Fatalf("read %q, %v; want the answer that arrived while the upload was blocked", got, err)
+		}
+	})
 }
 
 func TestUDPIdle(t *testing.T) {
