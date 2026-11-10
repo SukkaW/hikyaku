@@ -222,7 +222,7 @@ A frame may span several data chunks, and a data chunk may hold several frames.
 
 ### 4.2. Streams
 
-Only the client opens streams. Stream IDs are odd: the client's first stream is 3, and each new stream takes the next odd number (5, 7, ...). A client MUST NOT reuse a stream ID on a carrier. A server MUST NOT open streams.
+Only the client opens streams. Stream IDs are odd: the client's first stream is 3, and each new stream takes the next odd number (5, 7, ...). A client MUST NOT reuse a stream ID on a carrier, and MUST send each stream's SYN after the SYN of every lower-numbered stream. A server MUST NOT open streams.
 
 A stream opens with its SYN frame; its data follows in PSH frames.
 
