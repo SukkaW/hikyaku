@@ -29,7 +29,7 @@ const (
 // for half the name's DNS TTL, between minPin and maxPin, before the next race.
 type raceDialer struct {
 	dialer  net.Dialer
-	resolve func(ctx context.Context, host string) ([]netip.Addr, time.Duration, error)
+	resolve func(ctx context.Context, host string, found func(addrs []netip.Addr, ttl time.Duration)) error
 
 	mu      sync.Mutex
 	entries map[string]*list.Element // of *entry, in lru
@@ -93,55 +93,63 @@ func (d *raceDialer) DialContext(ctx context.Context, dst proxy.Addr) (net.Conn,
 		}
 		d.unpin(host)
 	}
-	addrs := cached.addrs
-	var resolveErr error
+	var looked <-chan error
 	switch {
-	case pinned || len(addrs) == 0:
+	case pinned || len(cached.addrs) == 0:
 		// Nothing cached, or the pin among the cached addresses failed or stalled: ask
-		// DNS now, falling back to the cached addresses if that fails.
-		var fresh []netip.Addr
-		var ttl time.Duration
-		fresh, ttl, resolveErr = d.resolve(ctx, host)
-		if resolveErr == nil {
-			d.remember(host, fresh, ttl)
-			addrs = fresh
-		} else if len(addrs) > 0 {
-			resolveErr = nil
-		} else if r.pending == 0 {
-			return nil, resolveErr
-		}
+		// DNS now, racing each answer as it arrives alongside the cached addresses.
+		looked = d.lookup(ctx, host, r)
 	case time.Now().After(cached.expires):
 		d.refresh(host)
 	}
-	for _, addr := range addrs {
-		if !r.tried[addr] {
-			r.start(addr)
-		}
-	}
-	if r.pending == 0 && len(r.errs) == 0 {
-		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
-	}
+	r.add(cached.addrs)
 	conn, winner, err := r.wait()
-	if err != nil && !pinned && len(cached.addrs) > 0 {
+	if conn == nil && looked == nil {
 		// Every cached address failed, so the name may have moved: ask DNS now.
-		if fresh, ttl, err2 := d.resolve(ctx, host); err2 == nil {
-			d.remember(host, fresh, ttl)
-			for _, addr := range fresh {
-				if !r.tried[addr] {
-					r.start(addr)
-				}
-			}
-			conn, winner, err = r.wait()
-		}
+		looked = d.lookup(ctx, host, r)
+		conn, winner, err = r.wait()
 	}
-	if err != nil {
-		if resolveErr != nil {
-			return nil, resolveErr
+	if conn == nil {
+		if lookupErr := <-looked; len(r.tried) == 0 {
+			if lookupErr != nil {
+				return nil, lookupErr
+			}
+			return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
 		}
 		return nil, err
 	}
 	d.pinTo(host, winner)
 	return conn, nil
+}
+
+// lookup resolves host in the background, caching each answer and adding its
+// addresses to r while r waits, and reports the lookup's error once it ends. It
+// outlives the dial, up to the dial's deadline, so answers that come after a winner
+// still reach the cache.
+func (d *raceDialer) lookup(ctx context.Context, host string, r *race) <-chan error {
+	more := make(chan []netip.Addr)
+	r.more = more
+	done := make(chan error, 1)
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(dialTimeout)
+	}
+	go func() {
+		lookupCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+		defer cancel()
+		first := true
+		err := d.resolve(lookupCtx, host, func(addrs []netip.Addr, ttl time.Duration) {
+			d.learn(host, addrs, ttl, first)
+			first = false
+			select {
+			case more <- addrs:
+			case <-ctx.Done():
+			}
+		})
+		close(more)
+		done <- err
+	}()
+	return done
 }
 
 // race holds one dial's connection attempts; the first to connect wins.
@@ -150,6 +158,7 @@ type race struct {
 	dialer  *net.Dialer
 	port    uint16
 	results chan dialResult
+	more    chan []netip.Addr // addresses still to come from a running lookup
 	tried   map[netip.Addr]bool
 	pending int
 	errs    []error
@@ -164,15 +173,34 @@ func (r *race) start(addr netip.Addr) {
 	}()
 }
 
-func (r *race) wait() (net.Conn, netip.Addr, error) {
-	for ; r.pending > 0; r.pending-- {
-		res := <-r.results
-		if res.err != nil {
-			r.errs = append(r.errs, res.err)
-			continue
+func (r *race) add(addrs []netip.Addr) {
+	for _, addr := range addrs {
+		if !r.tried[addr] {
+			r.start(addr)
 		}
-		go resetLosers(r.results, r.pending-1)
-		return res.conn, res.addr, nil
+	}
+}
+
+// wait returns the first connection to complete, taking in a running lookup's
+// addresses as they arrive, or every attempt's error once nothing is left to try.
+func (r *race) wait() (net.Conn, netip.Addr, error) {
+	for r.pending > 0 || r.more != nil {
+		select {
+		case res := <-r.results:
+			r.pending--
+			if res.err != nil {
+				r.errs = append(r.errs, res.err)
+				continue
+			}
+			go resetLosers(r.results, r.pending)
+			return res.conn, res.addr, nil
+		case addrs, ok := <-r.more:
+			if !ok {
+				r.more = nil
+				continue
+			}
+			r.add(addrs)
+		}
 	}
 	return nil, netip.Addr{}, errors.Join(r.errs...)
 }
@@ -218,17 +246,27 @@ func (d *raceDialer) entryFor(host string) *entry {
 	return e
 }
 
-// remember stores host's freshly resolved addresses, dropping a pin they no longer
-// include.
-func (d *raceDialer) remember(host string, addrs []netip.Addr, ttl time.Duration) {
-	if len(addrs) == 0 {
-		return
-	}
+// learn caches an answer's addresses for host. A lookup's first answer replaces what
+// was cached, dropping a pin it doesn't include; later answers add to it.
+func (d *raceDialer) learn(host string, addrs []netip.Addr, ttl time.Duration, first bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	e := d.entryFor(host)
-	e.addrs, e.ttl, e.expires, e.refreshing = addrs, ttl, time.Now().Add(ttl), false
-	if !slices.Contains(addrs, e.pin) {
+	expires := time.Now().Add(ttl)
+	if first {
+		e.addrs, e.ttl, e.expires = nil, ttl, expires
+	} else {
+		e.ttl = min(e.ttl, ttl)
+		if expires.Before(e.expires) {
+			e.expires = expires
+		}
+	}
+	for _, addr := range addrs {
+		if !slices.Contains(e.addrs, addr) {
+			e.addrs = append(e.addrs, addr)
+		}
+	}
+	if !slices.Contains(e.addrs, e.pin) {
 		e.pin = netip.Addr{}
 	}
 }
@@ -267,10 +305,11 @@ func (d *raceDialer) refresh(host string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		defer cancel()
-		if addrs, ttl, err := d.resolve(ctx, host); err == nil && len(addrs) > 0 {
-			d.remember(host, addrs, ttl)
-			return
-		}
+		first := true
+		d.resolve(ctx, host, func(addrs []netip.Addr, ttl time.Duration) {
+			d.learn(host, addrs, ttl, first)
+			first = false
+		})
 		d.mu.Lock()
 		if el, ok := d.entries[host]; ok {
 			el.Value.(*entry).refreshing = false

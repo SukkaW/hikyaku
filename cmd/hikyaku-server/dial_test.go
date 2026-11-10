@@ -77,13 +77,21 @@ func forget(d *raceDialer, host string) {
 	}
 }
 
+// answers returns a resolver that gives addrs with ttl as one answer, counting lookups.
+func answers(addrs []netip.Addr, ttl *time.Duration, lookups *atomic.Int32) func(context.Context, string, func([]netip.Addr, time.Duration)) error {
+	return func(_ context.Context, _ string, found func([]netip.Addr, time.Duration)) error {
+		lookups.Add(1)
+		found(addrs, *ttl)
+		return nil
+	}
+}
+
 func TestRaceDialPicksTheAnsweringAddress(t *testing.T) {
 	_, port := localListener(t)
 	d := newRaceDialer()
 	blackHole(d, "192.0.2.1")
-	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
-		return []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("127.0.0.1")}, time.Minute, nil
-	}
+	ttl := time.Minute
+	d.resolve = answers([]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("127.0.0.1")}, &ttl, new(atomic.Int32))
 	start := time.Now()
 	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "race.test", Port: port})
 	if err != nil {
@@ -126,12 +134,10 @@ func TestResetLosers(t *testing.T) {
 func TestPinnedAddress(t *testing.T) {
 	_, port := localListener(t)
 	local := netip.MustParseAddr("127.0.0.1")
-	races, ttl := 0, 10*time.Second
+	var races atomic.Int32
+	ttl := 10 * time.Second
 	d := newRaceDialer()
-	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
-		races++
-		return []netip.Addr{local}, ttl, nil
-	}
+	d.resolve = answers([]netip.Addr{local}, &ttl, &races)
 	dial := func() {
 		t.Helper()
 		conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "pin.test", Port: port})
@@ -144,8 +150,8 @@ func TestPinnedAddress(t *testing.T) {
 
 	dial()
 	dial()
-	if races != 1 {
-		t.Fatalf("%d races for two dials within the pin, want 1", races)
+	if n := races.Load(); n != 1 {
+		t.Fatalf("%d races for two dials within the pin, want 1", n)
 	}
 	if left := pinnedFor(); left > ttl/2 || left < ttl/2-time.Second {
 		t.Fatalf("pinned for %v, want half the %v TTL", left, ttl)
@@ -154,8 +160,8 @@ func TestPinnedAddress(t *testing.T) {
 	// An expired pin over addresses that are still fresh races them without DNS.
 	withEntry(d, "pin.test", func(e *entry) { e.pinUntil = time.Now().Add(-time.Second) })
 	dial()
-	if races != 1 || pinnedFor() < ttl/2-time.Second {
-		t.Fatalf("an expired pin over fresh addresses was not raced and pinned again without DNS (%d lookups)", races)
+	if n := races.Load(); n != 1 || pinnedFor() < ttl/2-time.Second {
+		t.Fatalf("an expired pin over fresh addresses was not raced and pinned again without DNS (%d lookups)", n)
 	}
 
 	// Nothing listens on [::1] at this port, so dialing the pin is refused at once.
@@ -164,7 +170,7 @@ func TestPinnedAddress(t *testing.T) {
 		e.addrs, e.pin, e.pinUntil = []netip.Addr{dead}, dead, time.Now().Add(time.Minute)
 	})
 	dial()
-	if races != 2 || d.cached("pin.test").pin != local {
+	if races.Load() != 2 || d.cached("pin.test").pin != local {
 		t.Fatalf("a pin that no longer answers was not raced again")
 	}
 
@@ -185,13 +191,11 @@ func TestPinnedAddress(t *testing.T) {
 
 func TestSilentPinRacesAfterAttemptDelay(t *testing.T) {
 	_, port := localListener(t)
-	races := 0
+	var races atomic.Int32
+	ttl := time.Minute
 	d := newRaceDialer()
 	blackHole(d, "192.0.2.1")
-	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
-		races++
-		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, time.Minute, nil
-	}
+	d.resolve = answers([]netip.Addr{netip.MustParseAddr("127.0.0.1")}, &ttl, &races)
 	withEntry(d, "hole.test", func(e *entry) {
 		hole := netip.MustParseAddr("192.0.2.1")
 		e.addrs, e.ttl, e.expires = []netip.Addr{hole}, time.Minute, time.Now().Add(time.Minute)
@@ -207,7 +211,7 @@ func TestSilentPinRacesAfterAttemptDelay(t *testing.T) {
 	if elapsed < attemptDelay || elapsed > attemptDelay+time.Second {
 		t.Fatalf("a silent pin was replaced after %v, want just past the %v attempt delay", elapsed, attemptDelay)
 	}
-	if races != 1 || d.cached("hole.test").pin != netip.MustParseAddr("127.0.0.1") {
+	if races.Load() != 1 || d.cached("hole.test").pin != netip.MustParseAddr("127.0.0.1") {
 		t.Fatalf("a silent pin was not replaced by the race's winner")
 	}
 }
@@ -215,12 +219,12 @@ func TestSilentPinRacesAfterAttemptDelay(t *testing.T) {
 func TestPinsEvictLeastRecentlyUsed(t *testing.T) {
 	d := newRaceDialer()
 	addrs := []netip.Addr{netip.MustParseAddr("127.0.0.1")}
-	d.remember("first", addrs, time.Minute)
+	d.learn("first", addrs, time.Minute, true)
 	for i := 1; i < maxPins; i++ {
-		d.remember(fmt.Sprintf("name%d.test", i), addrs, time.Minute)
+		d.learn(fmt.Sprintf("name%d.test", i), addrs, time.Minute, true)
 	}
 	d.cached("first")
-	d.remember("overflow.test", addrs, time.Minute)
+	d.learn("overflow.test", addrs, time.Minute, true)
 	if len(d.cached("first").addrs) == 0 {
 		t.Fatal("a recently used name was evicted")
 	}
@@ -237,10 +241,11 @@ func TestStaleAddressesServedWhileRefreshing(t *testing.T) {
 	local := netip.MustParseAddr("127.0.0.1")
 	var lookups atomic.Int32
 	d := newRaceDialer()
-	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
+	d.resolve = func(_ context.Context, _ string, found func([]netip.Addr, time.Duration)) error {
 		lookups.Add(1)
 		time.Sleep(300 * time.Millisecond)
-		return []netip.Addr{local}, time.Minute, nil
+		found([]netip.Addr{local}, time.Minute)
+		return nil
 	}
 	withEntry(d, "stale.test", func(e *entry) {
 		e.addrs, e.ttl, e.expires = []netip.Addr{local}, time.Minute, time.Now().Add(-time.Second)
@@ -273,12 +278,10 @@ func TestStaleAddressesServedWhileRefreshing(t *testing.T) {
 func TestCachedAddressesThatAllFailResolveAgain(t *testing.T) {
 	_, port := localListener(t)
 	local := netip.MustParseAddr("127.0.0.1")
-	lookups := 0
+	var lookups atomic.Int32
+	ttl := time.Minute
 	d := newRaceDialer()
-	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
-		lookups++
-		return []netip.Addr{local}, time.Minute, nil
-	}
+	d.resolve = answers([]netip.Addr{local}, &ttl, &lookups)
 	// The name moved: its cached address, [::1] at this port, refuses.
 	withEntry(d, "moved.test", func(e *entry) {
 		e.addrs, e.ttl, e.expires = []netip.Addr{netip.MustParseAddr("::1")}, time.Minute, time.Now().Add(time.Minute)
@@ -288,8 +291,8 @@ func TestCachedAddressesThatAllFailResolveAgain(t *testing.T) {
 		t.Fatalf("a name whose cached addresses all fail was not resolved again: %v", err)
 	}
 	conn.Close()
-	if lookups != 1 || !slices.Equal(d.cached("moved.test").addrs, []netip.Addr{local}) {
-		t.Fatalf("%d lookups, cached %v; want one lookup replacing the dead address", lookups, d.cached("moved.test").addrs)
+	if n := lookups.Load(); n != 1 || !slices.Equal(d.cached("moved.test").addrs, []netip.Addr{local}) {
+		t.Fatalf("%d lookups, cached %v; want one lookup replacing the dead address", n, d.cached("moved.test").addrs)
 	}
 }
 
@@ -299,9 +302,8 @@ func TestPinKeptOnlyWhileListed(t *testing.T) {
 	d := newRaceDialer()
 	slowDial(d, "127.0.0.1", 400*time.Millisecond)
 	// DNS no longer lists the pinned address; [::1] at this port refuses.
-	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
-		return []netip.Addr{netip.MustParseAddr("::1")}, time.Minute, nil
-	}
+	ttl := time.Minute
+	d.resolve = answers([]netip.Addr{netip.MustParseAddr("::1")}, &ttl, new(atomic.Int32))
 	withEntry(d, "old.test", func(e *entry) {
 		e.addrs, e.ttl, e.expires = []netip.Addr{old}, time.Minute, time.Now().Add(time.Minute)
 		e.pin, e.pinUntil = old, time.Now().Add(time.Minute)
@@ -318,12 +320,59 @@ func TestPinKeptOnlyWhileListed(t *testing.T) {
 
 func TestNoAddresses(t *testing.T) {
 	d := newRaceDialer()
-	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
-		return nil, time.Minute, nil
-	}
+	d.resolve = func(context.Context, string, func([]netip.Addr, time.Duration)) error { return nil }
 	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "empty.test", Port: 443})
 	var dnsErr *net.DNSError
 	if conn != nil || !errors.As(err, &dnsErr) {
 		t.Fatalf("got %v, %v; want no connection and a DNS error", conn, err)
+	}
+}
+
+func TestRaceWinsOnFirstAnswer(t *testing.T) {
+	_, port := localListener(t)
+	later := netip.MustParseAddr("192.0.2.30")
+	d := newRaceDialer()
+	d.resolve = func(_ context.Context, _ string, found func([]netip.Addr, time.Duration)) error {
+		found([]netip.Addr{netip.MustParseAddr("127.0.0.1")}, time.Minute)
+		time.Sleep(500 * time.Millisecond)
+		found([]netip.Addr{later}, time.Minute)
+		return nil
+	}
+	start := time.Now()
+	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "first.test", Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("the dial took %v, so it waited for the whole lookup", elapsed)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !slices.Contains(d.cached("first.test").addrs, later) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addrs := d.cached("first.test").addrs; !slices.Contains(addrs, later) {
+		t.Fatalf("cached %v; want the answer that came after the race merged in", addrs)
+	}
+}
+
+func TestLaterAnswerJoinsRunningRace(t *testing.T) {
+	_, port := localListener(t)
+	d := newRaceDialer()
+	blackHole(d, "192.0.2.1")
+	d.resolve = func(_ context.Context, _ string, found func([]netip.Addr, time.Duration)) error {
+		found([]netip.Addr{netip.MustParseAddr("192.0.2.1")}, time.Minute)
+		time.Sleep(300 * time.Millisecond)
+		found([]netip.Addr{netip.MustParseAddr("127.0.0.1")}, time.Minute)
+		return nil
+	}
+	start := time.Now()
+	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "join.test", Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("connected after %v; want the second answer's address to join the race at 300ms", elapsed)
 	}
 }

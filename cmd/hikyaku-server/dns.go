@@ -7,13 +7,13 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/proxyutil"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/osutil"
 	"github.com/miekg/dns"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -26,12 +26,16 @@ const (
 
 // lookupOS resolves host through Go's resolver, which follows the operating system's
 // configuration and hosts file.
-func lookupOS(ctx context.Context, host string) ([]netip.Addr, time.Duration, error) {
+func lookupOS(ctx context.Context, host string, found func([]netip.Addr, time.Duration)) error {
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return err
+	}
 	for i := range addrs {
 		addrs[i] = addrs[i].Unmap()
 	}
-	return addrs, noTTL, err
+	found(addrs, noTTL)
+	return nil
 }
 
 // dnsResolver resolves names through the DNS servers given with -dns, after the
@@ -39,10 +43,22 @@ func lookupOS(ctx context.Context, host string) ([]netip.Addr, time.Duration, er
 type dnsResolver struct {
 	upstreams []upstream.Upstream
 	hosts     *upstream.HostsResolver
-	queries   singleflight.Group
+
+	mu       sync.Mutex
+	inflight map[string]*sharedLookup
 }
 
-type resolved struct {
+// sharedLookup is one name's query to every server, shared by the dials that need it
+// while it runs. Every answer with addresses reaches each of them as it arrives.
+type sharedLookup struct {
+	mu      sync.Mutex
+	answers []answer
+	done    bool
+	err     error
+	changed chan struct{} // closed and replaced when an answer arrives or the query ends
+}
+
+type answer struct {
 	addrs []netip.Addr
 	ttl   time.Duration
 }
@@ -52,7 +68,7 @@ func newDNSResolver(servers []string) (*dnsResolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &dnsResolver{hosts: hosts}
+	r := &dnsResolver{hosts: hosts, inflight: make(map[string]*sharedLookup)}
 	for _, server := range servers {
 		// AddressToUpstream writes into its Options, so each server gets its own.
 		u, err := upstream.AddressToUpstream(server, &upstream.Options{Timeout: upstreamTimeout})
@@ -64,43 +80,71 @@ func newDNSResolver(servers []string) (*dnsResolver, error) {
 	return r, nil
 }
 
-func (r *dnsResolver) lookup(ctx context.Context, host string) ([]netip.Addr, time.Duration, error) {
+func (r *dnsResolver) lookup(ctx context.Context, host string, found func([]netip.Addr, time.Duration)) error {
 	if addrs, _ := r.hosts.LookupNetIP(ctx, "ip", strings.TrimSuffix(host, ".")); len(addrs) > 0 {
 		for i := range addrs {
 			addrs[i] = addrs[i].Unmap()
 		}
-		return addrs, noTTL, nil
+		found(addrs, noTTL)
+		return nil
 	}
-	// Concurrent requests for a name share one query, which each upstream's
-	// timeout bounds; every caller still gives up at its own deadline.
-	ch := r.queries.DoChan(host, func() (any, error) { return r.query(host) })
-	select {
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, 0, res.Err
+	// The shared query is bounded by each upstream's timeout; every caller still gives
+	// up at its own deadline.
+	l := r.join(host)
+	for seen := 0; ; {
+		l.mu.Lock()
+		answers, done, err, changed := l.answers, l.done, l.err, l.changed
+		l.mu.Unlock()
+		for ; seen < len(answers); seen++ {
+			found(answers[seen].addrs, answers[seen].ttl)
 		}
-		v := res.Val.(resolved)
-		return v.addrs, v.ttl, nil
-	case <-ctx.Done():
-		return nil, 0, ctx.Err()
+		if done {
+			return err
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
-// query asks every server for host's A and AAAA records at once and keeps, for each
-// record type, the first answer that has addresses. A server's NXDOMAIN or failure
-// waits for the others: the name fails only when no server has an address for it.
-func (r *dnsResolver) query(host string) (resolved, error) {
-	type answer struct {
-		qtype    uint16
+// join returns host's running query, starting one if there is none.
+func (r *dnsResolver) join(host string) *sharedLookup {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l, ok := r.inflight[host]; ok {
+		return l
+	}
+	l := &sharedLookup{changed: make(chan struct{})}
+	r.inflight[host] = l
+	go r.query(host, l)
+	return l
+}
+
+// update records an answer or the query's end, and wakes every dial waiting on it.
+func (l *sharedLookup) update(record func()) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	record()
+	close(l.changed)
+	l.changed = make(chan struct{})
+}
+
+// query asks every server for host's A and AAAA records at once and shares each
+// answer that has addresses as it arrives. A server's NXDOMAIN or failure waits for
+// the others: the name fails only when no server has an address for it.
+func (r *dnsResolver) query(host string, l *sharedLookup) {
+	type reply struct {
 		addrs    []netip.Addr
 		ttl      uint32
 		notFound bool
 	}
-	answers := make(chan answer, 2*len(r.upstreams))
+	replies := make(chan reply, 2*len(r.upstreams))
 	for _, u := range r.upstreams {
 		for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
 			go func() {
-				a := answer{qtype: qtype, ttl: math.MaxUint32}
+				a := reply{ttl: math.MaxUint32}
 				resp, err := u.Exchange(context.Background(), new(dns.Msg).SetQuestion(dns.Fqdn(host), qtype))
 				if err == nil {
 					a.notFound = resp.Rcode == dns.RcodeNameError
@@ -113,31 +157,29 @@ func (r *dnsResolver) query(host string) (resolved, error) {
 						}
 					}
 				}
-				answers <- a
+				replies <- a
 			}()
 		}
 	}
-	res := resolved{ttl: math.MaxInt64}
-	left := map[uint16]int{dns.TypeA: len(r.upstreams), dns.TypeAAAA: len(r.upstreams)}
-	notFound := false
-	for left[dns.TypeA]+left[dns.TypeAAAA] > 0 {
-		a := <-answers
-		if left[a.qtype] == 0 {
-			continue
-		}
-		left[a.qtype]--
+	notFound, found := false, false
+	for range cap(replies) {
+		a := <-replies
 		notFound = notFound || a.notFound
 		if len(a.addrs) > 0 {
-			left[a.qtype] = 0
-			res.addrs = append(res.addrs, a.addrs...)
-			res.ttl = min(res.ttl, time.Duration(a.ttl)*time.Second)
+			found = true
+			l.update(func() { l.answers = append(l.answers, answer{a.addrs, time.Duration(a.ttl) * time.Second}) })
 		}
 	}
-	if len(res.addrs) == 0 {
-		if notFound {
-			return res, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
-		}
-		return res, &net.DNSError{Err: "no DNS server answered with an address", Name: host}
+	r.mu.Lock()
+	delete(r.inflight, host)
+	r.mu.Unlock()
+	var err error
+	switch {
+	case found:
+	case notFound:
+		err = &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	default:
+		err = &net.DNSError{Err: "no DNS server answered with an address", Name: host}
 	}
-	return res, nil
+	l.update(func() { l.done, l.err = true, err })
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"slices"
@@ -66,7 +67,19 @@ func testResolver(t *testing.T, hosts string, servers ...string) *dnsResolver {
 	return r
 }
 
-func TestDNSFirstAnswerPerRecordType(t *testing.T) {
+// lookupAll runs a lookup to its end and returns every answer's addresses with the
+// shortest TTL among them.
+func lookupAll(ctx context.Context, r *dnsResolver, host string) ([]netip.Addr, time.Duration, error) {
+	var addrs []netip.Addr
+	ttl := time.Duration(math.MaxInt64)
+	err := r.lookup(ctx, host, func(found []netip.Addr, t time.Duration) {
+		addrs = append(addrs, found...)
+		ttl = min(ttl, t)
+	})
+	return addrs, ttl, err
+}
+
+func TestDNSIgnoresFailingServers(t *testing.T) {
 	failing := fakeDNS(t, func(dns.Question) (int, []dns.RR, time.Duration) { return dns.RcodeServerFailure, nil, 0 })
 	answering := fakeDNS(t, func(q dns.Question) (int, []dns.RR, time.Duration) {
 		if q.Qtype == dns.TypeA {
@@ -75,7 +88,7 @@ func TestDNSFirstAnswerPerRecordType(t *testing.T) {
 		}
 		return dns.RcodeSuccess, []dns.RR{rrAAAA(q.Name, 40, "2001:db8::7")}, 50 * time.Millisecond
 	})
-	addrs, ttl, err := testResolver(t, "", failing, answering).lookup(context.Background(), "name.test")
+	addrs, ttl, err := lookupAll(context.Background(), testResolver(t, "", failing, answering), "name.test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +101,29 @@ func TestDNSFirstAnswerPerRecordType(t *testing.T) {
 	}
 }
 
+func TestDNSAnswersArriveAsTheyCome(t *testing.T) {
+	at := func(ip string, delay time.Duration) string {
+		return fakeDNS(t, func(q dns.Question) (int, []dns.RR, time.Duration) {
+			if q.Qtype == dns.TypeA {
+				return dns.RcodeSuccess, []dns.RR{rrA(q.Name, 60, ip)}, delay
+			}
+			return dns.RcodeSuccess, nil, delay
+		})
+	}
+	r := testResolver(t, "", at("192.0.2.20", 0), at("192.0.2.21", 300*time.Millisecond))
+	start := time.Now()
+	var arrivals []time.Duration
+	err := r.lookup(context.Background(), "progressive.test", func([]netip.Addr, time.Duration) {
+		arrivals = append(arrivals, time.Since(start))
+	})
+	if err != nil || len(arrivals) != 2 {
+		t.Fatalf("got %d answers, %v; want one from each server", len(arrivals), err)
+	}
+	if arrivals[0] > 150*time.Millisecond || arrivals[1] < 250*time.Millisecond {
+		t.Fatalf("answers arrived at %v; want the fast server's at once and the slow one's after it", arrivals)
+	}
+}
+
 func TestDNSNotFoundWaitsForOtherServers(t *testing.T) {
 	missing := fakeDNS(t, func(dns.Question) (int, []dns.RR, time.Duration) { return dns.RcodeNameError, nil, 0 })
 	slow := fakeDNS(t, func(q dns.Question) (int, []dns.RR, time.Duration) {
@@ -96,13 +132,13 @@ func TestDNSNotFoundWaitsForOtherServers(t *testing.T) {
 		}
 		return dns.RcodeSuccess, nil, 100 * time.Millisecond
 	})
-	addrs, _, err := testResolver(t, "", missing, slow).lookup(context.Background(), "name.test")
+	addrs, _, err := lookupAll(context.Background(), testResolver(t, "", missing, slow), "name.test")
 	if err != nil || !slices.Equal(addrs, []netip.Addr{netip.MustParseAddr("192.0.2.8")}) {
 		t.Fatalf("got %v, %v; want the slower server's address despite the other's NXDOMAIN", addrs, err)
 	}
 
 	r := testResolver(t, "", missing, missing)
-	_, _, err = r.lookup(context.Background(), "gone.test")
+	_, _, err = lookupAll(context.Background(), r, "gone.test")
 	var dnsErr *net.DNSError
 	if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
 		t.Fatalf("got %v, want a not-found DNS error when every server says NXDOMAIN", err)
@@ -115,7 +151,7 @@ func TestDNSHostsFileFirst(t *testing.T) {
 		queries.Add(1)
 		return dns.RcodeSuccess, []dns.RR{rrA(q.Name, 60, "192.0.2.1")}, 0
 	})
-	addrs, ttl, err := testResolver(t, "192.0.2.9 hosted.test\n", server).lookup(context.Background(), "hosted.test")
+	addrs, ttl, err := lookupAll(context.Background(), testResolver(t, "192.0.2.9 hosted.test\n", server), "hosted.test")
 	if err != nil || !slices.Equal(addrs, []netip.Addr{netip.MustParseAddr("192.0.2.9")}) || ttl != noTTL {
 		t.Fatalf("got %v, %v, %v; want the hosts file's address with the %v no-TTL lifetime", addrs, ttl, err, noTTL)
 	}
@@ -134,7 +170,7 @@ func TestDNSConcurrentLookupsShareAQuery(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Go(func() {
-			if _, _, err := r.lookup(context.Background(), "shared.test"); err != nil {
+			if _, _, err := lookupAll(context.Background(), r, "shared.test"); err != nil {
 				t.Error(err)
 			}
 		})
@@ -152,7 +188,7 @@ func TestDNSLookupHonoursCallerDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, _, err := testResolver(t, "", slow).lookup(ctx, "slow.test")
+	_, _, err := lookupAll(ctx, testResolver(t, "", slow), "slow.test")
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
 		t.Fatalf("got %v after %v, want the caller's deadline", err, time.Since(start))
 	}
