@@ -12,6 +12,11 @@ loaded test with one short download that has two small fetches made during it.
 Runs on paths capped at 100 Mbit/s or less all run at once, since they spend their
 time waiting on delay; faster paths keep the CPU busy, so they run one at a time in a
 lane of their own alongside.
+
+Every system's client starts START_OFFSET_S after its netsim is ready, so seeded
+outages and spikes reach each system at the same point in its test, and TUIC uses the
+congestion control the kernel gives hikyaku's server. --repeat runs everything again
+with fresh seeds and reports medians with their range.
 """
 import argparse
 import concurrent.futures
@@ -76,6 +81,9 @@ BULK_SECONDS = 8
 BULK_LIMIT_S = 20
 QUICK_BULK_LIMIT_S = 6
 PARALLEL_MAX_MBPS = 100
+START_OFFSET_S = 3
+# Linux congestion control names and TUIC's equivalents.
+TUIC_CONGESTION = {"bbr": "bbr", "cubic": "cubic", "reno": "new_reno"}
 ENV = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -86,8 +94,8 @@ procs_lock = threading.Lock()
 class Run:
     """One system on one profile, on its own netsim instance and test website."""
 
-    def __init__(self, profile, system, instance):
-        self.profile, self.system, self.instance = profile, system, instance
+    def __init__(self, profile, system, instance, repeat=0):
+        self.profile, self.system, self.instance, self.repeat = profile, system, instance, repeat
         suffix = f"-{instance}" if instance else ""
         self.client_ns, self.server_ns = f"hk-client{suffix}", f"hk-server{suffix}"
         self.client = f"10.200.{instance}.1"
@@ -97,7 +105,8 @@ class Run:
         self.procs = []
 
     def path(self, name):
-        return os.path.join(opts.out, f"{self.profile}-{self.system}-{name}")
+        again = f"-r{self.repeat + 1}" if opts.repeat > 1 else ""
+        return os.path.join(opts.out, f"{self.profile}-{self.system}{again}-{name}")
 
 
 def say(msg):
@@ -137,6 +146,28 @@ def wait_for(run, name, needle, timeout):
                 return
         time.sleep(0.1)
     raise RuntimeError(f"{name} did not print {needle!r} within {timeout}s")
+
+
+def wait_listening(run, proto, port, timeout=10):
+    """Wait until a server in run's server namespace listens on port."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = subprocess.run(["ip", "netns", "exec", run.server_ns, "ss", "-Hltn" if proto == "tcp" else "-Hlun",
+                            f"sport = :{port}"], capture_output=True, text=True)
+        if r.stdout.strip():
+            return
+        time.sleep(0.05)
+    raise RuntimeError(f"{run.system} server is not listening on {proto} port {port} after {timeout}s")
+
+
+def congestion_control(run):
+    """The algorithm hikyaku's server gets: BBR when the kernel offers it, since hikyaku
+    asks for it, otherwise the kernel's default, which satmux always uses."""
+    def read(name):
+        return subprocess.run(["ip", "netns", "exec", run.server_ns, "cat", f"/proc/sys/net/ipv4/{name}"],
+                              capture_output=True, text=True, check=True).stdout.split()
+    available, default = read("tcp_available_congestion_control"), read("tcp_congestion_control")[0]
+    return ("bbr" if "bbr" in available else default), default
 
 
 def curl(run, socks, url, max_time):
@@ -185,29 +216,35 @@ def certs():
         "-out", "leaf.pem", "-days", "30", "-extfile", "leaf.ext")
 
 
-# Each system: start its server (hk-server), return a function that starts its client
-# (hk-client), and the client's SOCKS5 address.
-def hikyaku(run):
+# Each system: start its server (hk-server) and wait until it listens, then return a
+# function that starts its client (hk-client), the client's SOCKS5 address, and the
+# congestion control the system's server-to-client traffic uses.
+def hikyaku(run, cc):
     psk = secrets.token_urlsafe(24)
     spawn(run, [os.path.join(opts.hikyaku, "hikyaku-server"), "-listen", f"{run.server}:8445", "-allow-private",
                 "-psk", psk], "hikyaku-server", "server")
+    wait_listening(run, "tcp", 8445)
     client = [os.path.join(opts.hikyaku, "hikyaku-client"), "-listen", "127.0.0.1:1080", "-server",
               f"{run.server}:8445", "-psk", psk, "-carriers", "4"]
-    return lambda: spawn(run, client, "hikyaku-client", "client"), "127.0.0.1:1080"
+    return lambda: spawn(run, client, "hikyaku-client", "client"), "127.0.0.1:1080", cc[0]
 
 
-def satmux(run):
+def satmux(run, cc):
     psk = secrets.token_hex(32)
     spawn(run, ["python3", opts.satmux, "server", "--host", run.server, "--port", "8444"], "satmux-server", "server",
           {"SATMUX_PSK": psk})
+    wait_listening(run, "tcp", 8444)
     client = ["python3", opts.satmux, "client", "--host", run.server, "--port", "8444", "--carriers", "12",
               "--socks-port", "1081", "--http-port", "18080", "--fast-port", "18081",
               "--gh-sock", run.path("gh.sock")]
-    return lambda: spawn(run, client, "satmux-client", "client", {"SATMUX_PSK": psk}), "127.0.0.1:1081"
+    return lambda: spawn(run, client, "satmux-client", "client", {"SATMUX_PSK": psk}), "127.0.0.1:1081", cc[1]
 
 
-def tuic(run):
+def tuic(run, cc):
     uuid, password = "11111111-2222-3333-4444-555555555555", secrets.token_urlsafe(24)
+    if cc[0] not in TUIC_CONGESTION:
+        say(f"warning: TUIC has no {cc[0]}; using cubic")
+    congestion = TUIC_CONGESTION.get(cc[0], "cubic")
     server_toml, client_toml = run.path("tuic-server.toml"), run.path("tuic-client.toml")
     with open(server_toml, "w") as f:
         f.write(f'log_level = "info"\nserver = "{run.server}:7444"\n[users]\n"{uuid}" = "{password}"\n'
@@ -216,10 +253,11 @@ def tuic(run):
     with open(client_toml, "w") as f:
         f.write(f'log_level = "info"\n[relay]\nserver = "localhost:7444"\nip = "{run.server}"\nuuid = "{uuid}"\n'
                 f'password = "{password}"\ncertificates = ["{opts.certs}/ca.pem"]\nalpn = ["h3"]\n'
-                f'congestion_control = "bbr"\n[local]\nserver = "127.0.0.1:1082"\n')
+                f'congestion_control = "{congestion}"\n[local]\nserver = "127.0.0.1:1082"\n')
     spawn(run, [os.path.join(opts.tuic, "tuic-server"), "-c", server_toml], "tuic-server", "server")
+    wait_listening(run, "udp", 7444)
     client = [os.path.join(opts.tuic, "tuic-client"), "-c", client_toml]
-    return lambda: spawn(run, client, "tuic-client", "client"), "127.0.0.1:1082"
+    return lambda: spawn(run, client, "tuic-client", "client"), "127.0.0.1:1082", congestion
 
 
 SYSTEMS = {"hikyaku": hikyaku, "satmux": satmux, "tuic": tuic}
@@ -295,6 +333,7 @@ def execute(run, netsim_args, size):
     try:
         spawn(run, [opts.netsim, "-id", str(run.instance), *netsim_args], "netsim")
         wait_for(run, "netsim", "ready", 10)
+        ready_at = time.time()
         # Server TCP settings under test apply to this run's server namespace only.
         for setting in opts.server_sysctl:
             subprocess.run(["ip", "netns", "exec", run.server_ns, "sysctl", "-qw", setting], check=True)
@@ -307,9 +346,17 @@ def execute(run, netsim_args, size):
         spawn(run, ["python3", os.path.join(HERE, "origin.py"), os.path.join(opts.certs, "leaf.pem"),
                     os.path.join(opts.certs, "leaf.key")], "origin", "server")
         wait_for(run, "origin", "origin ready", 10)
-        start_client, socks = SYSTEMS[run.system](run)
-        time.sleep(1)
+        start_client, socks, congestion = SYSTEMS[run.system](run, congestion_control(run))
+        # Seeded outages and spikes count from netsim's start, so every system starts
+        # measuring at the same point in that pattern.
+        wait = ready_at + START_OFFSET_S - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        else:
+            say(f"warning: {run.profile} {run.system} took {START_OFFSET_S - wait:.1f}s to start, "
+                f"past the {START_OFFSET_S}s start offset")
         result = measure(run, start_client, socks, size)
+        result["congestion_control"] = congestion
         if run.system == "hikyaku":
             with open(run.path("hikyaku-client.log")) as f:
                 log = f.read()
@@ -320,17 +367,46 @@ def execute(run, netsim_args, size):
             stop(p)
 
 
+def failures(r):
+    return (r["burst_failures"] + r["loaded_failures"] + (r["cold_s"] is None) +
+            (r.get("after_idle_s", 0) is None))
+
+
+def combine(repeats):
+    """One result per system and profile: a single run as it is, or the medians of the
+    repeats with each value's range under "range"."""
+    if len(repeats) == 1:
+        return repeats[0]
+    out = {"repeats": repeats, "range": {}, "congestion_control": repeats[0]["congestion_control"]}
+    for key in ("cold_s", "burst_max_s", "bulk_mbps", "loaded_median_s", "after_idle_ttfb_s", "after_idle_s"):
+        values = [r[key] for r in repeats if r.get(key) is not None]
+        out[key] = round(statistics.median(values), 3) if values else None
+        if values:
+            out["range"][key] = (min(values), max(values))
+    out["bulk_mb"] = repeats[0]["bulk_mb"]
+    out["failures"] = sum(failures(r) for r in repeats)
+    if "carrier_events" in repeats[0]:
+        out["carrier_events"] = {k: sum(r["carrier_events"][k] for r in repeats) for k in repeats[0]["carrier_events"]}
+    return out
+
+
 def table(results):
     head = ("| Profile | System | Cold start | 6-way burst | Download | Small fetch during download "
-            "| 100 KB after 5 s idle (first byte / total) | Failures |")
-    lines = [head, "|" + "---|" * 8]
-    fmt = lambda v, unit="s": "fail" if v is None else f"{v} {unit}"
+            "| 100 KB after 5 s idle (first byte / total) | Congestion control | Failures |")
+    lines = [head, "|" + "---|" * 9]
     for profile, systems in results.items():
         for system, r in systems.items():
-            failures = r["burst_failures"] + r["loaded_failures"]
-            lines.append(f"| {profile} | {system} | {fmt(r['cold_s'])} | {fmt(r['burst_max_s'])} | {r['bulk_mbps']} Mbit/s "
-                         f"({r['bulk_mb']} MB) | {fmt(r['loaded_median_s'])} "
-                         f"| {fmt(r['after_idle_ttfb_s'])} / {fmt(r['after_idle_s'])} | {failures} |")
+            spread = r.get("range", {})
+
+            def fmt(key, unit="s"):
+                if r.get(key) is None:
+                    return "fail"
+                low_high = f" ({spread[key][0]}–{spread[key][1]})" if key in spread else ""
+                return f"{r[key]} {unit}{low_high}"
+            lines.append(f"| {profile} | {system} | {fmt('cold_s')} | {fmt('burst_max_s')} | {fmt('bulk_mbps', 'Mbit/s')} "
+                         f"({r['bulk_mb']} MB) | {fmt('loaded_median_s')} "
+                         f"| {fmt('after_idle_ttfb_s')} / {fmt('after_idle_s')} | {r['congestion_control']} "
+                         f"| {r['failures'] if 'failures' in r else failures(r)} |")
     return "\n".join(lines)
 
 
@@ -353,30 +429,41 @@ def main():
     ap.add_argument("--seed", type=int, default=None,
                     help="base seed for netsim's loss, outage and spike patterns (random by default); each profile "
                          "adds its position in --profiles, and every system on a profile gets the same pattern")
+    ap.add_argument("--repeat", type=int, default=1, help="run everything this many times, each with fresh seeds, "
+                    "and report medians with their range")
+    ap.add_argument("--jobs", type=int, default=0, help="at most this many runs at once on paths capped at "
+                    f"{PARALLEL_MAX_MBPS} Mbit/s or less (0: no limit)")
     opts = ap.parse_args()
     os.makedirs(opts.out, exist_ok=True)
     certs()
     seed = opts.seed if opts.seed is not None else secrets.randbelow(2**32)
 
     plans = []  # (run, label, netsim arguments, download size, capped)
-    for position, name in enumerate(opts.profiles.split(",")):
-        label, netsim_args = PROFILES[name]
-        rate = lambda flag, args=netsim_args: float(args[args.index(flag) + 1])
-        size = int(min(max(rate("-down-rate") * 1e6 / 8 * BULK_SECONDS, 1e6), 10e6))
-        capped = max(rate("-down-rate"), rate("-up-rate")) <= PARALLEL_MAX_MBPS
-        netsim_args = [*netsim_args, "-seed", str(seed + position)]
-        for system in opts.systems.split(","):
-            plans.append((Run(name, system, len(plans) + 1), label, netsim_args, size, capped))
+    profiles, systems = opts.profiles.split(","), opts.systems.split(",")
+    if len(profiles) * len(systems) * opts.repeat > 255:
+        sys.exit("too many runs: netsim has 255 instances")
+    for repeat in range(opts.repeat):
+        for position, name in enumerate(profiles):
+            label, netsim_args = PROFILES[name]
+            rate = lambda flag, args=netsim_args: float(args[args.index(flag) + 1])
+            size = int(min(max(rate("-down-rate") * 1e6 / 8 * BULK_SECONDS, 1e6), 10e6))
+            capped = max(rate("-down-rate"), rate("-up-rate")) <= PARALLEL_MAX_MBPS
+            netsim_args = [*netsim_args, "-seed", str(seed + position + 1000 * repeat)]
+            for system in systems:
+                plans.append((Run(name, system, len(plans) + 1, repeat), label, netsim_args, size, capped))
 
     measured = {}
 
     def go(plan):
         run, label, netsim_args, size, _ = plan
-        measured[(label, run.system)] = execute(run, netsim_args, size)
-        say(f"== {label}: {run.system}: {measured[(label, run.system)]}")
+        result = execute(run, netsim_args, size)
+        measured[(label, run.system, run.repeat)] = result
+        again = f" (repeat {run.repeat + 1})" if opts.repeat > 1 else ""
+        say(f"== {label}: {run.system}{again}: {result}")
 
     mode = "quick" if opts.quick else "full"
-    say(f"== {len(plans)} runs ({mode}), seed {seed}{', one at a time' if opts.sequential else ''}")
+    say(f"== {len(plans)} runs ({mode}), seed {seed}{', one at a time' if opts.sequential else ''}"
+        f"{f', at most {opts.jobs} capped runs at once' if opts.jobs > 0 and not opts.sequential else ''}")
     try:
         if opts.sequential:
             for plan in plans:
@@ -384,9 +471,10 @@ def main():
         else:
             capped = [p for p in plans if p[4]]
             fast = [p for p in plans if not p[4]]
-            with concurrent.futures.ThreadPoolExecutor(len(capped) + 1) as ex:
+            with concurrent.futures.ThreadPoolExecutor(min(len(capped), opts.jobs or len(capped)) or 1) as ex, \
+                    concurrent.futures.ThreadPoolExecutor(1) as lane:
                 futures = [ex.submit(go, p) for p in capped]
-                futures.append(ex.submit(lambda: [go(p) for p in fast]))
+                futures.append(lane.submit(lambda: [go(p) for p in fast]))
                 for f in futures:
                     f.result()
     finally:
@@ -394,10 +482,12 @@ def main():
             stop(p)
     results = {}
     for run, label, *_ in plans:
-        if (label, run.system) in measured:
-            results.setdefault(label, {})[run.system] = measured[(label, run.system)]
+        if run.repeat == 0:
+            repeats = [measured[(label, run.system, r)] for r in range(opts.repeat) if (label, run.system, r) in measured]
+            if repeats:
+                results.setdefault(label, {})[run.system] = combine(repeats)
     with open(os.path.join(opts.out, "results.json"), "w") as f:
-        json.dump({"mode": mode, "seed": seed, "results": results}, f, indent=2)
+        json.dump({"mode": mode, "seed": seed, "repeat": opts.repeat, "results": results}, f, indent=2)
     report = table(results)
     with open(os.path.join(opts.out, "results.md"), "w") as f:
         f.write(report + "\n")
