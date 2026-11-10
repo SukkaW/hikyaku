@@ -95,6 +95,9 @@ func (d *raceDialer) DialContext(ctx context.Context, dst proxy.Addr) (net.Conn,
 			r.start(addr)
 		}
 	}
+	if r.pending == 0 && len(r.errs) == 0 {
+		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
+	}
 	conn, winner, err := r.wait()
 	if err != nil {
 		if resolveErr != nil {

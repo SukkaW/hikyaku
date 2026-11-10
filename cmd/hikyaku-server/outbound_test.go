@@ -191,4 +191,21 @@ func TestResultCode(t *testing.T) {
 			t.Errorf("%v: code %d, want %d", err, got, want)
 		}
 	}
+
+	timeout := dial(os.ErrDeadlineExceeded)
+	netUnreachable := dial(os.NewSyscallError("connect", errNetUnreachable))
+	refused := dial(os.NewSyscallError("connect", errRefused))
+	races := []struct {
+		err  error
+		want byte
+	}{
+		{errors.Join(netUnreachable, timeout), proxy.ResultTimeout},
+		{errors.Join(netUnreachable, refused), proxy.ResultRefused},
+		{errors.Join(netUnreachable), proxy.ResultNetUnreachable},
+	}
+	for _, r := range races {
+		if got := resultCode(r.err); got != r.want {
+			t.Errorf("race failing with %q: code %d, want %d", r.err, got, r.want)
+		}
+	}
 }

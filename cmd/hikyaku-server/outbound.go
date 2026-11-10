@@ -40,7 +40,9 @@ func (o *outbound) handle(stream net.Conn) {
 		o.relayUDP(stream)
 		return
 	}
-	conn, err := o.dialer.DialContext(context.Background(), destination)
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	conn, err := o.dialer.DialContext(ctx, destination)
+	cancel()
 	if err != nil {
 		log.Printf("dial %s: %v", destination, err)
 		proxy.WriteResult(stream, resultCode(err), err.Error())
@@ -56,6 +58,20 @@ func (o *outbound) handle(stream net.Conn) {
 // resultCode tells the client why reaching the destination failed, so it can
 // separate a dead website from a dead carrier.
 func resultCode(err error) byte {
+	// A race that failed on every address reports its most telling attempt: an
+	// unreachable network is often only a missing IPv4 or IPv6 route, so it ranks last.
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		codes := make(map[byte]bool)
+		for _, e := range joined.Unwrap() {
+			codes[resultCode(e)] = true
+		}
+		for _, code := range []byte{proxy.ResultDNS, proxy.ResultTimeout, proxy.ResultRefused, proxy.ResultHostUnreachable, proxy.ResultNetUnreachable} {
+			if codes[code] {
+				return code
+			}
+		}
+		return proxy.ResultServerError
+	}
 	var dnsErr *net.DNSError
 	var netErr net.Error
 	switch {

@@ -227,3 +227,15 @@ func TestLookupDNS(t *testing.T) {
 		t.Fatalf("TTL %v, want the CNAME's shorter 30s", ttl)
 	}
 }
+
+func TestNoAddresses(t *testing.T) {
+	d := newRaceDialer()
+	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
+		return nil, time.Minute, nil
+	}
+	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "empty.test", Port: 443})
+	var dnsErr *net.DNSError
+	if conn != nil || !errors.As(err, &dnsErr) {
+		t.Fatalf("got %v, %v; want no connection and a DNS error", conn, err)
+	}
+}
