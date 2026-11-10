@@ -192,4 +192,34 @@ func TestDNSLookupHonoursCallerDeadline(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
 		t.Fatalf("got %v after %v, want the caller's deadline", err, time.Since(start))
 	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) || !dnsErr.IsTimeout {
+		t.Fatalf("got %v, want a DNS timeout error", err)
+	}
+}
+
+func TestDNSQueriesAdvertiseEDNS0(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sizes := make(chan uint16, 4)
+	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		var size uint16
+		if opt := r.IsEdns0(); opt != nil {
+			size = opt.UDPSize()
+		}
+		sizes <- size
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeNameError)
+		w.WriteMsg(m)
+	})}
+	go srv.ActivateAndServe()
+	t.Cleanup(func() { srv.Shutdown() })
+	lookupAll(context.Background(), testResolver(t, "", "udp://"+pc.LocalAddr().String()), "edns.test")
+	for range 2 {
+		if size := <-sizes; size != 1232 {
+			t.Fatalf("a query advertised a %d-byte EDNS0 limit, want 1232", size)
+		}
+	}
 }

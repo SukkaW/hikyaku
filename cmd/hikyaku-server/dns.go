@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -104,7 +105,8 @@ func (r *dnsResolver) lookup(ctx context.Context, host string, found func([]neti
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return ctx.Err()
+			// A DNS failure, as Go's resolver reports it, not the dial's own timeout.
+			return &net.DNSError{Err: ctx.Err().Error(), Name: host, IsTimeout: errors.Is(ctx.Err(), context.DeadlineExceeded), UnwrapErr: ctx.Err()}
 		}
 	}
 }
@@ -145,7 +147,8 @@ func (r *dnsResolver) query(host string, l *sharedLookup) {
 		for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
 			go func() {
 				a := reply{ttl: math.MaxUint32}
-				resp, err := u.Exchange(context.Background(), new(dns.Msg).SetQuestion(dns.Fqdn(host), qtype))
+				// EDNS0's 1232-byte limit keeps larger answers from being cut at 512 bytes.
+				resp, err := u.Exchange(context.Background(), new(dns.Msg).SetQuestion(dns.Fqdn(host), qtype).SetEdns0(1232, false))
 				if err == nil {
 					a.notFound = resp.Rcode == dns.RcodeNameError
 					if resp.Rcode == dns.RcodeSuccess {
