@@ -221,8 +221,8 @@ def certs():
 # congestion control the system's server-to-client traffic uses.
 def hikyaku(run, cc):
     psk = secrets.token_urlsafe(24)
-    spawn(run, [os.path.join(opts.hikyaku, "hikyaku-server"), "-listen", f"{run.server}:8445", "-allow-private",
-                "-psk", psk], "hikyaku-server", "server")
+    spawn(run, [os.path.join(opts.hikyaku, "hikyaku-server"), "-listen", f"{run.server}:8445", "-psk", psk],
+          "hikyaku-server", "server")
     wait_listening(run, "tcp", 8445)
     client = [os.path.join(opts.hikyaku, "hikyaku-client"), "-listen", "127.0.0.1:1080", "-server",
               f"{run.server}:8445", "-psk", psk, "-carriers", "4"]

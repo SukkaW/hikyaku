@@ -15,7 +15,7 @@ import (
 
 func TestPingAndGoAway(t *testing.T) {
 	got := make(chan []byte, 4)
-	c, _ := startCarrier(t, false, func(cmd byte, body []byte) { got <- append([]byte{cmd}, body...) })
+	c, _ := startCarrier(t, func(cmd byte, body []byte) { got <- append([]byte{cmd}, body...) })
 	next := func(what string) []byte {
 		t.Helper()
 		select {
@@ -91,7 +91,7 @@ func (l *failingListener) Accept() (net.Conn, error) {
 
 func TestServeSurvivesAcceptErrors(t *testing.T) {
 	ln := &failingListener{errs: []error{syscall.EMFILE, net.ErrClosed}}
-	if err := serve(ln, []byte("psk"), newOutbound(false)); !errors.Is(err, net.ErrClosed) {
+	if err := serve(ln, []byte("psk"), newOutbound()); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("serve returned %v, want it to keep accepting until the listener closes", err)
 	}
 }

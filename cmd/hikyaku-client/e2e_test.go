@@ -26,7 +26,7 @@ func startServer(t testing.TB, psk string) string {
 	if out, err := exec.Command("go", "build", "-o", bin, "github.com/SukkaW/hikyaku/cmd/hikyaku-server").CombinedOutput(); err != nil {
 		t.Fatalf("build server: %v\n%s", err, out)
 	}
-	cmd := exec.Command(bin, "-listen", "127.0.0.1:0", "-allow-private", "-psk", psk)
+	cmd := exec.Command(bin, "-listen", "127.0.0.1:0", "-psk", psk)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatal(err)

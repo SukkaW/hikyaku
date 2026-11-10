@@ -35,7 +35,6 @@ var live = struct {
 func main() {
 	listen := flag.String("listen", ":8444", "carrier listen address")
 	psk := flag.String("psk", "", "pre-shared key, any string")
-	allowPrivate := flag.Bool("allow-private", false, "allow loopback, private, link-local, multicast and unspecified destinations")
 	genkey := flag.Bool("genkey", false, "print a new random PSK and exit")
 	flag.Parse()
 
@@ -61,7 +60,7 @@ func main() {
 		goAway()
 		os.Exit(0)
 	}()
-	log.Fatal(serve(ln, []byte(*psk), newOutbound(*allowPrivate)))
+	log.Fatal(serve(ln, []byte(*psk), newOutbound()))
 }
 
 // goAway tells every client its carriers are going away, then gives their streams up

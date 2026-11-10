@@ -18,35 +18,12 @@ const (
 	dialTimeout   = 10 * time.Second
 )
 
-var errForbidden = errors.New("destination address not allowed")
-
 type outbound struct {
-	allowPrivate bool
-	dialer       net.Dialer
+	dialer net.Dialer
 }
 
-func newOutbound(allowPrivate bool) *outbound {
-	o := &outbound{allowPrivate: allowPrivate, dialer: net.Dialer{Timeout: dialTimeout}}
-	if !allowPrivate {
-		// Checked at connect time, so every address a hostname resolves to is covered
-		// and DNS cannot point the server at an internal service.
-		o.dialer.ControlContext = func(_ context.Context, _, address string, _ syscall.RawConn) error {
-			ap, err := netip.ParseAddrPort(address)
-			if err != nil {
-				return err
-			}
-			if !public(ap.Addr()) {
-				return errForbidden
-			}
-			return nil
-		}
-	}
-	return o
-}
-
-func public(addr netip.Addr) bool {
-	addr = addr.Unmap()
-	return !addr.IsLoopback() && !addr.IsPrivate() && !addr.IsLinkLocalUnicast() && !addr.IsMulticast() && !addr.IsUnspecified()
+func newOutbound() *outbound {
+	return &outbound{dialer: net.Dialer{Timeout: dialTimeout}}
 }
 
 func (o *outbound) handle(stream *smux.Stream) {
@@ -84,8 +61,6 @@ func resultCode(err error) byte {
 	var dnsErr *net.DNSError
 	var netErr net.Error
 	switch {
-	case errors.Is(err, errForbidden):
-		return proxy.ResultBlocked
 	case errors.As(err, &dnsErr):
 		return proxy.ResultDNS
 	case errors.Is(err, syscall.ECONNREFUSED):
@@ -150,8 +125,7 @@ func (o *outbound) relayUDP(stream net.Conn) {
 	}
 }
 
-// udpTarget applies the destination policy to a datagram, resolving names once per
-// association.
+// udpTarget finds where a datagram goes, resolving names once per association.
 func (o *outbound) udpTarget(dst proxy.Addr, resolved map[string]netip.Addr) (netip.AddrPort, bool) {
 	addr := dst.IP.Unmap()
 	if dst.Domain != "" {
@@ -163,9 +137,6 @@ func (o *outbound) udpTarget(dst proxy.Addr, resolved map[string]netip.Addr) (ne
 			}
 			resolved[dst.Domain] = addr
 		}
-	}
-	if !o.allowPrivate && !public(addr) {
-		return netip.AddrPort{}, false
 	}
 	return netip.AddrPortFrom(addr, dst.Port), true
 }

@@ -15,9 +15,9 @@ import (
 	"github.com/xtaci/smux"
 )
 
-func openStream(t testing.TB, allowPrivate bool, request []byte) *smux.Stream {
+func openStream(t testing.TB, request []byte) *smux.Stream {
 	t.Helper()
-	_, session := startCarrier(t, allowPrivate, nil)
+	_, session := startCarrier(t, nil)
 	stream, err := session.OpenStream()
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func openStream(t testing.TB, allowPrivate bool, request []byte) *smux.Stream {
 
 // startCarrier starts a server and opens one carrier to it; onControl, if set,
 // receives the server's control messages.
-func startCarrier(t testing.TB, allowPrivate bool, onControl func(cmd byte, body []byte)) (*proxy.Conn, *smux.Session) {
+func startCarrier(t testing.TB, onControl func(cmd byte, body []byte)) (*proxy.Conn, *smux.Session) {
 	t.Helper()
 	psk := make([]byte, proxy.PSKSize)
 	rand.Read(psk)
@@ -39,7 +39,7 @@ func startCarrier(t testing.TB, allowPrivate bool, onControl func(cmd byte, body
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	go serve(ln, psk, newOutbound(allowPrivate))
+	go serve(ln, psk, newOutbound())
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
@@ -95,45 +95,25 @@ func TestTCPTarget(t *testing.T) {
 		}
 	}()
 	request := connectTo(t, target.Addr())
-
-	t.Run("refused", func(t *testing.T) {
-		stream := openStream(t, false, request)
-		stream.SetReadDeadline(time.Now().Add(5 * time.Second))
-		if err := proxy.ReadAck(stream); err != nil {
-			t.Fatal(err)
-		}
-		var failed *proxy.ResultError
-		if err := proxy.ReadResult(stream); !errors.As(err, &failed) || failed.Code != proxy.ResultBlocked {
-			t.Fatalf("result: got %v, want the loopback target blocked", err)
-		}
-		if _, err := stream.Read(make([]byte, 1)); err != io.EOF {
-			t.Fatalf("stream read: got %v, want EOF after the failed result", err)
-		}
-		if len(accepted) != 0 {
-			t.Fatal("server connected to a loopback target")
-		}
-	})
-
-	t.Run("allowed", func(t *testing.T) {
-		stream := openStream(t, true, request)
-		stream.Write([]byte("ping"))
-		var conn net.Conn
-		select {
-		case conn = <-accepted:
-		case <-time.After(5 * time.Second):
-			t.Fatal("server never connected to the target")
-		}
-		defer conn.Close()
-		got := make([]byte, 4)
-		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "ping" {
-			t.Fatalf("target read %q, %v", got, err)
-		}
-		conn.Write([]byte("pong"))
-		readReplies(t, stream)
-		if _, err := io.ReadFull(stream, got); err != nil || string(got) != "pong" {
-			t.Fatalf("stream read %q, %v", got, err)
-		}
-	})
+	// A loopback target, as for a tunnel into internal infrastructure, is reachable.
+	stream := openStream(t, request)
+	stream.Write([]byte("ping"))
+	var conn net.Conn
+	select {
+	case conn = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never connected to the target")
+	}
+	defer conn.Close()
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(conn, got); err != nil || string(got) != "ping" {
+		t.Fatalf("target read %q, %v", got, err)
+	}
+	conn.Write([]byte("pong"))
+	readReplies(t, stream)
+	if _, err := io.ReadFull(stream, got); err != nil || string(got) != "pong" {
+		t.Fatalf("stream read %q, %v", got, err)
+	}
 }
 
 // readReplies reads the server's acknowledgement and a successful result.
@@ -164,8 +144,8 @@ func TestUDPTarget(t *testing.T) {
 		}
 	}()
 
-	roundTrip := func(t *testing.T, allowPrivate bool) error {
-		stream := openStream(t, allowPrivate, proxy.UDPRequest)
+	t.Run("loopback target", func(t *testing.T) {
+		stream := openStream(t, proxy.UDPRequest)
 		readReplies(t, stream)
 		echoAddr := addrOf(t, echo.LocalAddr())
 		if err := proxy.WritePacket(stream, echoAddr, []byte("ping")); err != nil {
@@ -174,27 +154,14 @@ func TestUDPTarget(t *testing.T) {
 		stream.SetReadDeadline(time.Now().Add(time.Second))
 		source, payload, err := proxy.ReadPacket(stream, make([]byte, proxy.MaxPacket))
 		if err != nil {
-			return err
+			t.Fatal(err)
 		}
 		if string(payload) != "ping" || source != echoAddr {
 			t.Fatalf("echo returned %q from %s", payload, source)
 		}
-		return nil
-	}
-
-	t.Run("refused", func(t *testing.T) {
-		var timeout net.Error
-		if err := roundTrip(t, false); !errors.As(err, &timeout) || !timeout.Timeout() {
-			t.Fatalf("got %v, want the datagram to a loopback target dropped", err)
-		}
-	})
-	t.Run("allowed", func(t *testing.T) {
-		if err := roundTrip(t, true); err != nil {
-			t.Fatal(err)
-		}
 	})
 	t.Run("bad packet skipped", func(t *testing.T) {
-		stream := openStream(t, true, proxy.UDPRequest)
+		stream := openStream(t, proxy.UDPRequest)
 		readReplies(t, stream)
 		if _, err := stream.Write([]byte{0, 1, 9}); err != nil {
 			t.Fatal(err)
@@ -213,7 +180,6 @@ func TestUDPTarget(t *testing.T) {
 func TestResultCode(t *testing.T) {
 	dial := func(err error) error { return &net.OpError{Op: "dial", Net: "tcp", Err: err} }
 	cases := map[byte]error{
-		proxy.ResultBlocked:         dial(errForbidden),
 		proxy.ResultDNS:             &net.DNSError{Err: "no such host", Name: "example.invalid", IsNotFound: true},
 		proxy.ResultRefused:         dial(os.NewSyscallError("connect", syscall.ECONNREFUSED)),
 		proxy.ResultNetUnreachable:  dial(os.NewSyscallError("connect", syscall.ENETUNREACH)),
