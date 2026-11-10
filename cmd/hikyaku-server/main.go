@@ -92,6 +92,7 @@ func goAway() {
 }
 
 func serve(ln net.Listener, psk []byte, out *outbound) error {
+	ln = proxy.KeepAccepting(ln)
 	replay := proxy.NewReplayFilter()
 	for {
 		conn, err := ln.Accept()

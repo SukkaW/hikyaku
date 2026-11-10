@@ -39,7 +39,7 @@ func (h *inbound) serve(ln net.Listener) error {
 		socks5.WithConnectHandle(h.connect),
 		socks5.WithAssociateHandle(h.associate),
 	)
-	return server.Serve(ln)
+	return server.Serve(proxy.KeepAccepting(ln))
 }
 
 // remoteResolver leaves domain names alone, so the hikyaku server resolves them

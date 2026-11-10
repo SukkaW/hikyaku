@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"net"
+	"syscall"
 	"testing"
 	"time"
 
@@ -72,5 +74,24 @@ func TestIdleCarrierClosed(t *testing.T) {
 	case <-session.CloseChan():
 	case <-time.After(5 * time.Second):
 		t.Fatal("server kept a carrier that sent nothing")
+	}
+}
+
+// failingListener returns errs from Accept in turn.
+type failingListener struct {
+	net.Listener
+	errs []error
+}
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	err := l.errs[0]
+	l.errs = l.errs[1:]
+	return nil, err
+}
+
+func TestServeSurvivesAcceptErrors(t *testing.T) {
+	ln := &failingListener{errs: []error{syscall.EMFILE, net.ErrClosed}}
+	if err := serve(ln, []byte("psk"), newOutbound(false)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("serve returned %v, want it to keep accepting until the listener closes", err)
 	}
 }
