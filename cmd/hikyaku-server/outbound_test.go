@@ -31,7 +31,7 @@ func openStream(t testing.TB, request []byte) *smux.Stream {
 // receives the server's control messages.
 func startCarrier(t testing.TB, onControl func(cmd byte, body []byte)) (*proxy.Conn, *smux.Session) {
 	t.Helper()
-	psk := make([]byte, proxy.PSKSize)
+	psk := make([]byte, 32)
 	rand.Read(psk)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

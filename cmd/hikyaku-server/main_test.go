@@ -41,7 +41,7 @@ func TestPingAndGoAway(t *testing.T) {
 }
 
 func TestIdleCarrierClosed(t *testing.T) {
-	psk := make([]byte, proxy.PSKSize)
+	psk := make([]byte, 32)
 	rand.Read(psk)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

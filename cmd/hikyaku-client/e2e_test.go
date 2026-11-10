@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukkaW/hikyaku/proxy"
 	"github.com/things-go/go-socks5/statute"
 )
 
@@ -70,7 +69,7 @@ func startClient(t testing.TB, server string, psk []byte) socksClient {
 }
 
 func TestEndToEnd(t *testing.T) {
-	key := make([]byte, proxy.PSKSize)
+	key := make([]byte, 32)
 	rand.Read(key)
 	psk := base64.StdEncoding.EncodeToString(key)
 	client := startClient(t, startServer(t, psk), []byte(psk))
@@ -391,7 +390,7 @@ func TestUDPIdleCountsReplies(t *testing.T) {
 			origin.WriteTo([]byte("update"), addr)
 		}
 	}()
-	key := make([]byte, proxy.PSKSize)
+	key := make([]byte, 32)
 	rand.Read(key)
 	psk := base64.StdEncoding.EncodeToString(key)
 	client := startClient(t, startServer(t, psk), []byte(psk))

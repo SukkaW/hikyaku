@@ -37,7 +37,7 @@ func tcpPair(t *testing.T) (client, server net.Conn) {
 }
 
 func newPSK() []byte {
-	psk := make([]byte, PSKSize)
+	psk := make([]byte, 32)
 	rand.Read(psk)
 	return psk
 }

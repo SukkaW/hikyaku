@@ -2,11 +2,8 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -38,15 +35,8 @@ var live = struct {
 func main() {
 	listen := flag.String("listen", ":8444", "carrier listen address")
 	psk := flag.String("psk", "", "pre-shared key, any string")
-	genkey := flag.Bool("genkey", false, "print a new random PSK and exit")
 	flag.Parse()
 
-	if *genkey {
-		key := make([]byte, proxy.PSKSize)
-		rand.Read(key)
-		fmt.Println(base64.StdEncoding.EncodeToString(key))
-		return
-	}
 	if *psk == "" {
 		log.Fatal("-psk is required")
 	}

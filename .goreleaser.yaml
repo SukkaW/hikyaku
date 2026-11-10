@@ -76,4 +76,4 @@ brews:
       bin.install "hikyaku-server"
       bin.install "hikyaku-client"
     test: |
-      system bin/"hikyaku-server", "-genkey"
+      system bin/"hikyaku-server", "-h"

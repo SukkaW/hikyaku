@@ -53,7 +53,7 @@ func stallingOrigin(t *testing.T, firstFlight int) (string, <-chan []byte) {
 }
 
 func TestReplay(t *testing.T) {
-	key := make([]byte, proxy.PSKSize)
+	key := make([]byte, 32)
 	rand.Read(key)
 	psk := base64.StdEncoding.EncodeToString(key)
 	server := startServer(t, psk)
@@ -140,7 +140,7 @@ func TestReplay(t *testing.T) {
 }
 
 func TestCutOffResponseIsReset(t *testing.T) {
-	key := make([]byte, proxy.PSKSize)
+	key := make([]byte, 32)
 	rand.Read(key)
 	psk := base64.StdEncoding.EncodeToString(key)
 	p := newPool(startServer(t, psk), []byte(psk), 2)

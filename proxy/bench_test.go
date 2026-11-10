@@ -17,7 +17,7 @@ func carrierPair(b *testing.B) (client, server *Conn) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { ln.Close() })
-	psk := make([]byte, PSKSize)
+	psk := make([]byte, 32)
 	rand.Read(psk)
 	type accepted struct {
 		c   *Conn

@@ -31,10 +31,9 @@ go install github.com/SukkaW/hikyaku/cmd/hikyaku-client@latest
 
 ## Server
 
-Run the server on a host the client can reach over TCP. Any string works as the pre-shared key; `-genkey` prints a random one.
+Run the server on a host the client can reach over TCP. Any string works as the pre-shared key.
 
 ```sh
-hikyaku-server -genkey
 hikyaku-server -psk 'your-psk'
 ```
 
@@ -42,7 +41,6 @@ hikyaku-server -psk 'your-psk'
 | --------- | ---------- | ------------------------------------------------ |
 | `-listen` | `:8444`    | Address to listen on for clients                 |
 | `-psk`    | (required) | Pre-shared key; the client must use the same one |
-| `-genkey` |            | Print a new random pre-shared key and exit       |
 
 On Linux, the server uses BBR congestion control when the kernel provides it (for example after `modprobe tcp_bbr`); otherwise it logs a warning and uses the system default.
 

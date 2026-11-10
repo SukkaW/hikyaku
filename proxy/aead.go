@@ -18,8 +18,6 @@ import (
 )
 
 const (
-	PSKSize = 32
-
 	saltSize = 32
 	maxChunk = 16 << 10
 	// maxRecvChunk is the longest chunk a receiver accepts, the most a 15-bit length
