@@ -305,9 +305,10 @@ func (e *events) at(t time.Time) time.Duration {
 }
 
 type packet struct {
-	data []byte
-	buf  *[]byte
-	due  time.Time
+	data    []byte
+	buf     *[]byte
+	due     time.Time
+	arrived time.Time // when it reached the link; the fair-queue sender schedules from it
 }
 
 var buffers = sync.Pool{New: func() any {
@@ -379,6 +380,9 @@ func flowOf(b []byte) flow {
 	return f
 }
 
+// fqLookahead is how far the fair-queue sender may run ahead of the clock.
+const fqLookahead = 2 * time.Millisecond
+
 // forwardFair queues each connection's packets separately, dropping a packet that
 // would take its own connection's queue past l.queue at the bandwidth cap, while a
 // sender serves the queues in turn, one packet each. A busy connection then waits
@@ -413,15 +417,19 @@ func (l *link) forwardFair(src *os.File, out chan<- packet) {
 			}
 			mu.Unlock()
 			now := time.Now()
-			start := now
+			start := p.arrived
 			if busyUntil.After(start) {
 				start = busyUntil
 			}
 			start = l.resume(start)
 			busyUntil = start.Add(time.Duration(float64(len(p.data)) / l.rate * float64(time.Second)))
-			// One packet is on the wire at a time, so the next turn is chosen only once
-			// this one has left, letting connections that wake meanwhile go next.
-			time.Sleep(time.Until(busyUntil))
+			// Departures are scheduled in link time, so waking late loses nothing. Running
+			// at most fqLookahead ahead of the clock needs no timer per packet, which
+			// timers cannot keep up with at high rates, yet a connection that wakes
+			// meanwhile still takes one of the next turns.
+			if ahead := time.Until(busyUntil); ahead > fqLookahead {
+				time.Sleep(ahead - fqLookahead)
+			}
 			due := busyUntil.Add(l.delay + l.spikes.at(now)/2)
 			if due.Before(lastDue) {
 				due = lastDue
@@ -437,7 +445,8 @@ func (l *link) forwardFair(src *os.File, out chan<- packet) {
 		if err != nil {
 			log.Fatalf("read %s: %v", src.Name(), err)
 		}
-		if l.outages.at(time.Now()) > 0 || (l.loss > 0 && l.rng.Float64() < l.loss) {
+		now := time.Now()
+		if l.outages.at(now) > 0 || (l.loss > 0 && l.rng.Float64() < l.loss) {
 			buffers.Put(buf)
 			continue
 		}
@@ -451,7 +460,7 @@ func (l *link) forwardFair(src *os.File, out chan<- packet) {
 		if len(queues[f]) == 0 {
 			turns = append(turns, f)
 		}
-		queues[f] = append(queues[f], packet{data: (*buf)[:n], buf: buf})
+		queues[f] = append(queues[f], packet{data: (*buf)[:n], buf: buf, arrived: now})
 		queued[f] += n
 		mu.Unlock()
 		select {
