@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"syscall"
 	"testing"
 	"time"
 
@@ -181,9 +180,9 @@ func TestResultCode(t *testing.T) {
 	dial := func(err error) error { return &net.OpError{Op: "dial", Net: "tcp", Err: err} }
 	cases := map[byte]error{
 		proxy.ResultDNS:             &net.DNSError{Err: "no such host", Name: "example.invalid", IsNotFound: true},
-		proxy.ResultRefused:         dial(os.NewSyscallError("connect", syscall.ECONNREFUSED)),
-		proxy.ResultNetUnreachable:  dial(os.NewSyscallError("connect", syscall.ENETUNREACH)),
-		proxy.ResultHostUnreachable: dial(os.NewSyscallError("connect", syscall.EHOSTUNREACH)),
+		proxy.ResultRefused:         dial(os.NewSyscallError("connect", errRefused)),
+		proxy.ResultNetUnreachable:  dial(os.NewSyscallError("connect", errNetUnreachable)),
+		proxy.ResultHostUnreachable: dial(os.NewSyscallError("connect", errHostUnreachable)),
 		proxy.ResultTimeout:         dial(os.ErrDeadlineExceeded),
 		proxy.ResultServerError:     errors.New("something else"),
 	}

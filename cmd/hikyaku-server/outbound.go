@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"net/netip"
-	"syscall"
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
@@ -62,11 +61,11 @@ func resultCode(err error) byte {
 	switch {
 	case errors.As(err, &dnsErr):
 		return proxy.ResultDNS
-	case errors.Is(err, syscall.ECONNREFUSED):
+	case errors.Is(err, errRefused):
 		return proxy.ResultRefused
-	case errors.Is(err, syscall.ENETUNREACH):
+	case errors.Is(err, errNetUnreachable):
 		return proxy.ResultNetUnreachable
-	case errors.Is(err, syscall.EHOSTUNREACH):
+	case errors.Is(err, errHostUnreachable):
 		return proxy.ResultHostUnreachable
 	case errors.As(err, &netErr) && netErr.Timeout():
 		return proxy.ResultTimeout
