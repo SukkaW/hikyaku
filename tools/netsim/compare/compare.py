@@ -36,7 +36,8 @@ def each_way(percent):
 # Wi-Fi: GEO round trips of 620-750 ms with little random loss, and Starlink with
 # 30-65 ms; outage, spike and queue settings are engineering estimates. geo-congested-fq
 # is congested GEO behind a bottleneck that queues each connection separately; whether
-# real cabin links do so is unknown.
+# real cabin links do so is unknown. geo-deepfq gives each connection a 1.5 s queue, deep
+# enough that a busy carrier's replies wait behind its own data for seconds.
 PROFILES = {
     "10ms": ("10 ms, 0% loss, 500 Mbit/s", ["-rtt", "10ms", "-down-rate", "500", "-up-rate", "500"]),
     "50ms": ("50 ms, 0% loss, 500 Mbit/s", ["-rtt", "50ms", "-down-rate", "500", "-up-rate", "500"]),
@@ -49,6 +50,8 @@ PROFILES = {
                       ["-rtt", "620ms", "-down-rate", "5.9", "-up-rate", "3.9", "-queue", "250ms"]),
     "geo-congested-fq": ("Congested GEO, queued per connection: 620 ms, 5.9/3.9 Mbit/s",
                          ["-rtt", "620ms", "-down-rate", "5.9", "-up-rate", "3.9", "-queue", "250ms", "-fq"]),
+    "geo-deepfq": ("Congested GEO, 1.5 s queue per connection: 620 ms, 5.9/3.9 Mbit/s",
+                   ["-rtt", "620ms", "-down-rate", "5.9", "-up-rate", "3.9", "-queue", "1500ms", "-fq"]),
     "geo-impaired": ("Impaired GEO: 750 ms, 0.1% loss each way, ~10 s blackouts every ~90 s, 5/1 Mbit/s",
                      ["-rtt", "750ms", "-loss", each_way(0.1), "-outage-every", "90s", "-outage-for", "10s",
                       "-down-rate", "5", "-up-rate", "1", "-queue", "250ms"]),
@@ -347,16 +350,21 @@ def main():
     ap.add_argument("--server-sysctl", action="append", default=[], metavar="KEY=VALUE",
                     help="sysctl to set in each server namespace, e.g. net.ipv4.tcp_slow_start_after_idle=0")
     ap.add_argument("--initcwnd", type=int, default=0, help="initial congestion window for server-to-client routes")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="base seed for netsim's loss, outage and spike patterns (random by default); each profile "
+                         "adds its position in --profiles, and every system on a profile gets the same pattern")
     opts = ap.parse_args()
     os.makedirs(opts.out, exist_ok=True)
     certs()
+    seed = opts.seed if opts.seed is not None else secrets.randbelow(2**32)
 
     plans = []  # (run, label, netsim arguments, download size, capped)
-    for name in opts.profiles.split(","):
+    for position, name in enumerate(opts.profiles.split(",")):
         label, netsim_args = PROFILES[name]
         rate = lambda flag, args=netsim_args: float(args[args.index(flag) + 1])
         size = int(min(max(rate("-down-rate") * 1e6 / 8 * BULK_SECONDS, 1e6), 10e6))
         capped = max(rate("-down-rate"), rate("-up-rate")) <= PARALLEL_MAX_MBPS
+        netsim_args = [*netsim_args, "-seed", str(seed + position)]
         for system in opts.systems.split(","):
             plans.append((Run(name, system, len(plans) + 1), label, netsim_args, size, capped))
 
@@ -368,7 +376,7 @@ def main():
         say(f"== {label}: {run.system}: {measured[(label, run.system)]}")
 
     mode = "quick" if opts.quick else "full"
-    say(f"== {len(plans)} runs ({mode}){', one at a time' if opts.sequential else ''}")
+    say(f"== {len(plans)} runs ({mode}), seed {seed}{', one at a time' if opts.sequential else ''}")
     try:
         if opts.sequential:
             for plan in plans:
@@ -389,7 +397,7 @@ def main():
         if (label, run.system) in measured:
             results.setdefault(label, {})[run.system] = measured[(label, run.system)]
     with open(os.path.join(opts.out, "results.json"), "w") as f:
-        json.dump({"mode": mode, "results": results}, f, indent=2)
+        json.dump({"mode": mode, "seed": seed, "results": results}, f, indent=2)
     report = table(results)
     with open(os.path.join(opts.out, "results.md"), "w") as f:
         f.write(report + "\n")
