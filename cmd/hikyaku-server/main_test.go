@@ -63,6 +63,71 @@ func TestGoAwayReachesCarriersJoiningDuringShutdown(t *testing.T) {
 	}
 }
 
+// liveStreams counts the server's open streams over every live carrier.
+func liveStreams() int {
+	live.Lock()
+	defer live.Unlock()
+	n := 0
+	for _, session := range live.carriers {
+		n += session.NumStreams()
+	}
+	return n
+}
+
+func waitStreams(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && liveStreams() != want {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := liveStreams(); n != want {
+		t.Fatalf("%d open streams on the server, want %d", n, want)
+	}
+}
+
+func TestShutdownGraceWaitsForCarriersJoiningDuringIt(t *testing.T) {
+	t.Cleanup(endShutdown)
+	waitStreams(t, 0)
+	target, _ := localListener(t)
+	openHeld := func(session *smux.Session) {
+		t.Helper()
+		stream, err := session.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stream.Write(connectTo(t, target.Addr())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, beforeSession := startCarrier(t, nil)
+	openHeld(beforeSession)
+	waitStreams(t, 1)
+	done := make(chan struct{})
+	go func() {
+		goAway()
+		close(done)
+	}()
+	joined, joinedSession := startCarrier(t, nil)
+	openHeld(joinedSession)
+	waitStreams(t, 2)
+
+	beforeSession.Close()
+	before.Close()
+	waitStreams(t, 1)
+	select {
+	case <-done:
+		t.Fatal("shutdown ended while a carrier that joined during it still had a stream open")
+	case <-time.After(500 * time.Millisecond):
+	}
+	joinedSession.Close()
+	joined.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shutdown kept waiting after every stream ended")
+	}
+}
+
 func TestEarlyResetForAnyUnopenedStream(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	client, err := smux.Client(clientConn, proxy.MuxConfig())

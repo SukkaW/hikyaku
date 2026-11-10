@@ -85,20 +85,22 @@ func main() {
 func goAway() {
 	live.Lock()
 	live.goingAway = true
-	sessions := make([]*smux.Session, 0, len(live.carriers))
-	for c, session := range live.carriers {
+	for c := range live.carriers {
 		// A carrier whose writes are stuck must not hold up the others.
 		go c.WriteControl(proxy.CtrlGoAway, goAwayBody)
-		sessions = append(sessions, session)
 	}
+	told := len(live.carriers)
 	live.Unlock()
-	log.Printf("shutting down: told %d carriers to go away", len(sessions))
+	log.Printf("shutting down: told %d carriers to go away", told)
 	deadline := time.Now().Add(shutdownGrace)
 	for time.Now().Before(deadline) {
+		// Counted afresh each time, so carriers that join during shutdown get the grace too.
+		live.Lock()
 		streams := 0
-		for _, session := range sessions {
+		for _, session := range live.carriers {
 			streams += session.NumStreams()
 		}
+		live.Unlock()
 		if streams == 0 {
 			return
 		}
@@ -187,9 +189,10 @@ func serveCarrier(conn net.Conn, psk []byte, replay *proxy.ReplayFilter, out *ou
 // A RESET can overtake its stream's SYN, which waits in smux's queue, so a RESET for
 // an id with no open stream is kept until headerTimeout in case its SYN follows.
 type streams struct {
-	mu    sync.Mutex
-	open  map[uint32]*resettable
-	early map[uint32]time.Time // when each early RESET arrived
+	mu     sync.Mutex
+	open   map[uint32]*resettable
+	early  map[uint32]time.Time // when each early RESET arrived
+	pruned time.Time
 }
 
 func newStreams() *streams {
@@ -227,9 +230,13 @@ func (s *streams) reset(id uint32) {
 		return
 	}
 	now := time.Now()
-	for early, at := range s.early {
-		if now.Sub(at) > headerTimeout {
-			delete(s.early, early)
+	// Pruning at most once a second keeps a burst of RESETs from costing quadratic time.
+	if now.Sub(s.pruned) > time.Second {
+		s.pruned = now
+		for early, at := range s.early {
+			if now.Sub(at) > headerTimeout {
+				delete(s.early, early)
+			}
 		}
 	}
 	s.early[id] = now
