@@ -40,6 +40,40 @@ func TestPingAndGoAway(t *testing.T) {
 	}
 }
 
+func TestEarlyResetForAnyUnopenedStream(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	client, err := smux.Client(clientConn, proxy.MuxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := smux.Server(serverConn, proxy.MuxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	accepted := make(map[uint32]*smux.Stream)
+	for range 2 {
+		if _, err := client.OpenStream(); err != nil {
+			t.Fatal(err)
+		}
+		st, err := server.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted[st.ID()] = st
+	}
+	// Stream 5's SYN overtook stream 3's, and 3's RESET came before its SYN.
+	s := newStreams()
+	if !s.add(&resettable{Stream: accepted[5]}) {
+		t.Fatal("stream 5 was refused")
+	}
+	s.reset(3)
+	if s.add(&resettable{Stream: accepted[3]}) {
+		t.Fatal("a stream the client reset before its SYN arrived was accepted")
+	}
+}
+
 func TestIdleCarrierClosed(t *testing.T) {
 	psk := make([]byte, 32)
 	rand.Read(psk)

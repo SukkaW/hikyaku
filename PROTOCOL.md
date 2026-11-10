@@ -179,7 +179,7 @@ Either side sends RESET when its end of a stream ended in an error, such as an a
 
 The sender MUST write the RESET before the stream's FIN frame (Section 4.4), so it arrives first. A receiver of RESET MUST abort its end of the stream: it ends the app connection or destination connection with an error (for TCP, a reset) rather than a clean close, and stops reading and writing the stream.
 
-A RESET can arrive before the SYN frame that opens its stream. A server that receives RESET for a stream ID greater than any it has seen opened MUST remember it, and abort that stream as soon as its SYN arrives. A receiver MUST ignore RESET for any other stream ID it does not know.
+A RESET can arrive before the SYN frame that opens its stream. A server that receives RESET for a stream ID with no open stream MUST remember it for at least 10 seconds, and abort that stream if its SYN arrives in that time. A client MUST ignore RESET for a stream ID it does not know.
 
 ### 3.5. Carrier Lifetime
 
@@ -222,7 +222,7 @@ A frame may span several data chunks, and a data chunk may hold several frames.
 
 ### 4.2. Streams
 
-Only the client opens streams. Stream IDs are odd: the client's first stream is 3, and each new stream takes the next odd number (5, 7, ...). A client MUST NOT reuse a stream ID on a carrier, and MUST send each stream's SYN after the SYN of every lower-numbered stream. A server MUST NOT open streams.
+Only the client opens streams. Stream IDs are odd: the client's first stream is 3, and each new stream takes the next odd number (5, 7, ...). A client MUST NOT reuse a stream ID on a carrier. SYN frames may arrive out of stream ID order. A server MUST NOT open streams.
 
 A stream opens with its SYN frame; its data follows in PSH frames.
 

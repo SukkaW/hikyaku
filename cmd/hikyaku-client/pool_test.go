@@ -113,51 +113,6 @@ func TestPoolWarmBurst(t *testing.T) {
 
 // Streams opened at once on one carrier reach the server in stream id order, which
 // the server's handling of a RESET that overtakes its stream's SYN relies on.
-func TestStreamsOpenInIDOrder(t *testing.T) {
-	psk := "syn-order-test"
-	ids := make(chan uint32, 1024)
-	p := newPool(fakeServer(t, psk, func(_ *proxy.Conn, s *smux.Session) {
-		for {
-			st, err := s.AcceptStream()
-			if err != nil {
-				return
-			}
-			ids <- st.ID()
-		}
-	}), []byte(psk), 1)
-	p.warm()
-	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
-	const rounds, concurrent = 10, 32
-	for range rounds {
-		var wg sync.WaitGroup
-		for range concurrent {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, s, err := p.openStream()
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				s.Close()
-			}()
-		}
-		wg.Wait()
-	}
-	var last uint32
-	for i := range rounds * concurrent {
-		select {
-		case id := <-ids:
-			if id <= last {
-				t.Fatalf("stream %d reached the server after stream %d", id, last)
-			}
-			last = id
-		case <-time.After(5 * time.Second):
-			t.Fatalf("only %d of %d streams reached the server", i, rounds*concurrent)
-		}
-	}
-}
-
 func TestPoolWakesWaiters(t *testing.T) {
 	psk := "wake-waiters-test"
 	p := newPool(startServer(t, psk), []byte(psk), 1)

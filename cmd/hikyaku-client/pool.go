@@ -71,9 +71,6 @@ type carrier struct {
 	lastStream atomic.Int64           // unix nanoseconds when a stream last closed
 	goaway     atomic.Pointer[string] // the server's reason, once it sent GOAWAY
 	pingNow    chan bool              // asks for a ping; true if the carrier is quiet
-	// openMu keeps the carrier's SYNs in stream id order: smux assigns the id before
-	// queueing the SYN, and the server's handling of an early RESET relies on the order.
-	openMu sync.Mutex
 
 	mu         sync.Mutex
 	unanswered map[*replayStream]struct{}
@@ -636,9 +633,7 @@ func (p *pool) openStream() (*carrier, *carrierStream, error) {
 		changed := p.changed
 		p.mu.Unlock()
 		if c := p.pick(); c != nil {
-			c.openMu.Lock()
 			s, err := c.session.OpenStream()
-			c.openMu.Unlock()
 			if err != nil {
 				return nil, nil, err
 			}

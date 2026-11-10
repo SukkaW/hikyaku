@@ -161,17 +161,16 @@ func serveCarrier(conn net.Conn, psk []byte, replay *proxy.ReplayFilter, out *ou
 }
 
 // streams tracks a carrier's open streams by id, so the client's RESET can abort one.
-// A RESET can overtake its stream's SYN, which waits in smux's queue; the client's
-// stream ids only increase, so one for an id past the newest accepted waits for it.
+// A RESET can overtake its stream's SYN, which waits in smux's queue, so a RESET for
+// an id with no open stream is kept until headerTimeout in case its SYN follows.
 type streams struct {
-	mu     sync.Mutex
-	open   map[uint32]*resettable
-	early  map[uint32]struct{}
-	newest uint32
+	mu    sync.Mutex
+	open  map[uint32]*resettable
+	early map[uint32]time.Time // when each early RESET arrived
 }
 
 func newStreams() *streams {
-	return &streams{open: make(map[uint32]*resettable), early: make(map[uint32]struct{})}
+	return &streams{open: make(map[uint32]*resettable), early: make(map[uint32]time.Time)}
 }
 
 // add records an accepted stream, reporting false if the client already reset it.
@@ -179,13 +178,8 @@ func (s *streams) add(stream *resettable) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := stream.ID()
-	s.newest = max(s.newest, id)
 	_, reset := s.early[id]
-	for early := range s.early {
-		if early <= id {
-			delete(s.early, early)
-		}
-	}
+	delete(s.early, id)
 	if !reset {
 		s.open[id] = stream
 	}
@@ -207,9 +201,15 @@ func (s *streams) reset(id uint32) {
 	if stream, ok := s.open[id]; ok {
 		stream.reset.Store(true)
 		go stream.Stream.Close()
-	} else if id > s.newest {
-		s.early[id] = struct{}{}
+		return
 	}
+	now := time.Now()
+	for early, at := range s.early {
+		if now.Sub(at) > headerTimeout {
+			delete(s.early, early)
+		}
+	}
+	s.early[id] = now
 }
 
 // resettable is a stream whose Abort resets the client's end too, and whose reads
