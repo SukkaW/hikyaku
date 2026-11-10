@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -87,6 +88,42 @@ func TestHandshakeRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, down) {
 		t.Fatal("server to client payload mismatch")
+	}
+}
+
+// writeChunk seals payload as one data chunk of any length, as another sender may.
+func writeChunk(c *Conn, payload []byte) error {
+	var length [2]byte
+	binary.BigEndian.PutUint16(length[:], uint16(len(payload)))
+	buf := c.seal.Seal(nil, c.sealNonce[:], length[:], nil)
+	increment(&c.sealNonce)
+	buf = c.seal.Seal(buf, c.sealNonce[:], payload, nil)
+	increment(&c.sealNonce)
+	_, err := c.Conn.Write(buf)
+	return err
+}
+
+func TestLongestChunkAccepted(t *testing.T) {
+	psk := newPSK()
+	clientRaw, serverRaw := tcpPair(t)
+	result := serve(serverRaw, psk, NewReplayFilter())
+	client, err := ClientHandshake(clientRaw, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := <-result
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	payload := make([]byte, maxRecvChunk)
+	rand.Read(payload)
+	go writeChunk(client, payload)
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(r.conn, got); err != nil {
+		t.Fatalf("reading a %d-byte chunk: %v", len(payload), err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("payload mismatch")
 	}
 }
 

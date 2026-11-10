@@ -22,6 +22,9 @@ const (
 
 	saltSize = 32
 	maxChunk = 16 << 10
+	// maxRecvChunk is the longest chunk a receiver accepts, the most a 15-bit length
+	// holds, so a sender may use longer chunks than maxChunk without a new version.
+	maxRecvChunk = 1<<15 - 1
 	// readBuffer is the carrier's read buffer; a server allocates it only once the
 	// client's hello authenticates.
 	readBuffer = 64 << 10
@@ -33,7 +36,7 @@ const (
 	replayGenerationSize = 100_000
 
 	// controlFlag marks a chunk as a carrier control message rather than smux data;
-	// chunks are at most maxChunk long, so the length's top bit is free.
+	// chunks are at most maxRecvChunk long, so the length's top bit is free.
 	controlFlag = 0x8000
 )
 
@@ -333,8 +336,8 @@ func (c *Conn) writeWithPrefix(prefix, b []byte, flag uint16) error {
 // arrive before it to the control handler.
 func (c *Conn) readChunk() ([]byte, error) {
 	overhead := c.open.Overhead()
-	if cap(c.rbuf) < maxChunk+overhead {
-		c.rbuf = make([]byte, maxChunk+overhead)
+	if cap(c.rbuf) < maxRecvChunk+overhead {
+		c.rbuf = make([]byte, maxRecvChunk+overhead)
 	}
 	for {
 		header := c.rbuf[:2+overhead]
@@ -349,7 +352,7 @@ func (c *Conn) readChunk() ([]byte, error) {
 		n := int(binary.BigEndian.Uint16(length))
 		control := n&controlFlag != 0
 		n &^= controlFlag
-		if n == 0 || n > maxChunk {
+		if n == 0 || n > maxRecvChunk {
 			return nil, fmt.Errorf("invalid chunk length %d", n)
 		}
 		payload := c.rbuf[:n+overhead]

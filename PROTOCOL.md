@@ -90,13 +90,13 @@ length (u16be, before encryption):
 ```
 
 - `C` (the most significant bit): `0` for a data chunk, `1` for a control chunk.
-- `L`: the payload's length before encryption, from 1 to 16384.
+- `L`: the payload's length before encryption, from 1 to 32767.
 
 The payload of a data chunk is the next `L` bytes of the carrier's multiplexing byte stream (Section 4). Chunk boundaries carry no meaning: a receiver MUST treat the payloads of a direction's data chunks, in order, as one continuous byte stream.
 
 The payload of a control chunk is one control message (Section 3.4) and is not part of the byte stream.
 
-A receiver MUST close the carrier when a chunk fails authentication, or when `L` is 0 or greater than 16384.
+A receiver MUST close the carrier when a chunk fails authentication, or when `L` is 0.
 
 ### 3.2. Handshake
 
@@ -360,7 +360,7 @@ The server sends packets for a stream from one UDP socket, and relays back every
 
 | Condition | Action |
 |---|---|
-| A chunk fails authentication, or `L` is 0 or above 16384 | close the carrier |
+| A chunk fails authentication, or `L` is 0 | close the carrier |
 | Bad hello chunk, or a remembered `client_salt` | server closes the carrier without replying |
 | Bad acknowledgement chunk, or a version the client does not speak | client closes the carrier |
 | Frame with `VER` other than 2, an unknown `CMD`, or a bad `LENGTH` | close the carrier |
