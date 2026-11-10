@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -30,15 +31,22 @@ type raceDialer struct {
 	dialer  net.Dialer
 	resolve func(ctx context.Context, host string) ([]netip.Addr, time.Duration, error)
 
-	mu     sync.Mutex
-	pinned map[string]*list.Element // of *pin, in lru
-	lru    list.List                // most recently used at the front
+	mu      sync.Mutex
+	entries map[string]*list.Element // of *entry, in lru
+	lru     list.List                // most recently used at the front
 }
 
-type pin struct {
-	host  string
-	addr  netip.Addr
-	until time.Time
+// entry caches a name's addresses and the race winner pinned among them. Addresses
+// outlive their expiry until the LRU evicts the name: expired ones are raced at once
+// while a refresh runs behind them, and dead ones are found by the race.
+type entry struct {
+	host       string
+	addrs      []netip.Addr
+	ttl        time.Duration
+	expires    time.Time
+	refreshing bool
+	pin        netip.Addr
+	pinUntil   time.Time
 }
 
 type dialResult struct {
@@ -51,7 +59,7 @@ func newRaceDialer() *raceDialer {
 	return &raceDialer{
 		dialer:  net.Dialer{Timeout: dialTimeout},
 		resolve: lookupOS,
-		pinned:  make(map[string]*list.Element),
+		entries: make(map[string]*list.Element),
 	}
 }
 
@@ -66,10 +74,12 @@ func (d *raceDialer) DialContext(ctx context.Context, dst proxy.Addr) (net.Conn,
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	r := &race{ctx: ctx, dialer: &d.dialer, port: dst.Port, results: make(chan dialResult), tried: make(map[netip.Addr]bool)}
-	if addr, ok := d.pinnedAddr(host); ok {
+	cached := d.cached(host)
+	pinned := cached.pin.IsValid() && time.Now().Before(cached.pinUntil)
+	if pinned {
 		// A pin that fails, or stays silent past attemptDelay, is dropped at once; a
 		// pinned address that is only slow keeps its attempt in the race.
-		r.start(addr)
+		r.start(cached.pin)
 		timer := time.NewTimer(attemptDelay)
 		select {
 		case res := <-r.results:
@@ -83,9 +93,25 @@ func (d *raceDialer) DialContext(ctx context.Context, dst proxy.Addr) (net.Conn,
 		}
 		d.unpin(host)
 	}
-	addrs, ttl, resolveErr := d.resolve(ctx, host)
-	if resolveErr != nil && r.pending == 0 {
-		return nil, resolveErr
+	addrs := cached.addrs
+	var resolveErr error
+	switch {
+	case pinned || len(addrs) == 0:
+		// Nothing cached, or the pin among the cached addresses failed or stalled: ask
+		// DNS now, falling back to the cached addresses if that fails.
+		var fresh []netip.Addr
+		var ttl time.Duration
+		fresh, ttl, resolveErr = d.resolve(ctx, host)
+		if resolveErr == nil {
+			d.remember(host, fresh, ttl)
+			addrs = fresh
+		} else if len(addrs) > 0 {
+			resolveErr = nil
+		} else if r.pending == 0 {
+			return nil, resolveErr
+		}
+	case time.Now().After(cached.expires):
+		d.refresh(host)
 	}
 	for _, addr := range addrs {
 		if !r.tried[addr] {
@@ -96,15 +122,25 @@ func (d *raceDialer) DialContext(ctx context.Context, dst proxy.Addr) (net.Conn,
 		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
 	}
 	conn, winner, err := r.wait()
+	if err != nil && !pinned && len(cached.addrs) > 0 {
+		// Every cached address failed, so the name may have moved: ask DNS now.
+		if fresh, ttl, err2 := d.resolve(ctx, host); err2 == nil {
+			d.remember(host, fresh, ttl)
+			for _, addr := range fresh {
+				if !r.tried[addr] {
+					r.start(addr)
+				}
+			}
+			conn, winner, err = r.wait()
+		}
+	}
 	if err != nil {
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
 		return nil, err
 	}
-	if resolveErr == nil {
-		d.pin(host, winner, min(max(ttl/2, minPin), maxPin))
-	}
+	d.pinTo(host, winner)
 	return conn, nil
 }
 
@@ -154,45 +190,91 @@ func resetLosers(results <-chan dialResult, n int) {
 	}
 }
 
-func (d *raceDialer) pinnedAddr(host string) (netip.Addr, bool) {
+// cached returns a copy of host's entry, or the zero entry if there is none.
+func (d *raceDialer) cached(host string) entry {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	e, ok := d.pinned[host]
-	if !ok {
-		return netip.Addr{}, false
+	if el, ok := d.entries[host]; ok {
+		d.lru.MoveToFront(el)
+		return *el.Value.(*entry)
 	}
-	p := e.Value.(*pin)
-	if time.Now().After(p.until) {
-		d.lru.Remove(e)
-		delete(d.pinned, host)
-		return netip.Addr{}, false
-	}
-	d.lru.MoveToFront(e)
-	return p.addr, true
+	return entry{}
 }
 
-func (d *raceDialer) pin(host string, addr netip.Addr, ttl time.Duration) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	p := &pin{host, addr, time.Now().Add(ttl)}
-	if e, ok := d.pinned[host]; ok {
-		e.Value = p
-		d.lru.MoveToFront(e)
-		return
+// entryFor returns host's entry, creating it, and evicting the least recently used
+// name if the cache is full. d.mu must be held.
+func (d *raceDialer) entryFor(host string) *entry {
+	if el, ok := d.entries[host]; ok {
+		d.lru.MoveToFront(el)
+		return el.Value.(*entry)
 	}
-	d.pinned[host] = d.lru.PushFront(p)
+	e := &entry{host: host}
+	d.entries[host] = d.lru.PushFront(e)
 	if d.lru.Len() > maxPins {
 		oldest := d.lru.Back()
 		d.lru.Remove(oldest)
-		delete(d.pinned, oldest.Value.(*pin).host)
+		delete(d.entries, oldest.Value.(*entry).host)
+	}
+	return e
+}
+
+// remember stores host's freshly resolved addresses, dropping a pin they no longer
+// include.
+func (d *raceDialer) remember(host string, addrs []netip.Addr, ttl time.Duration) {
+	if len(addrs) == 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.entryFor(host)
+	e.addrs, e.ttl, e.expires, e.refreshing = addrs, ttl, time.Now().Add(ttl), false
+	if !slices.Contains(addrs, e.pin) {
+		e.pin = netip.Addr{}
+	}
+}
+
+// pinTo pins host to a race's winner for half its addresses' lifetime, if they
+// include the winner.
+func (d *raceDialer) pinTo(host string, winner netip.Addr) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if el, ok := d.entries[host]; ok {
+		if e := el.Value.(*entry); slices.Contains(e.addrs, winner) {
+			e.pin, e.pinUntil = winner, time.Now().Add(min(max(e.ttl/2, minPin), maxPin))
+		}
 	}
 }
 
 func (d *raceDialer) unpin(host string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if e, ok := d.pinned[host]; ok {
-		d.lru.Remove(e)
-		delete(d.pinned, host)
+	if el, ok := d.entries[host]; ok {
+		el.Value.(*entry).pin = netip.Addr{}
 	}
+}
+
+// refresh resolves host again in the background, one refresh at a time, while its
+// expired addresses keep serving.
+func (d *raceDialer) refresh(host string) {
+	d.mu.Lock()
+	el, ok := d.entries[host]
+	if !ok || el.Value.(*entry).refreshing {
+		d.mu.Unlock()
+		return
+	}
+	el.Value.(*entry).refreshing = true
+	d.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		defer cancel()
+		if addrs, ttl, err := d.resolve(ctx, host); err == nil && len(addrs) > 0 {
+			d.remember(host, addrs, ttl)
+			return
+		}
+		d.mu.Lock()
+		if el, ok := d.entries[host]; ok {
+			el.Value.(*entry).refreshing = false
+		}
+		d.mu.Unlock()
+	}()
 }

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -44,11 +47,34 @@ func blackHole(d *raceDialer, addr string) {
 	}
 }
 
-func pinOf(d *raceDialer, host string) pin {
-	if e, ok := d.pinned[host]; ok {
-		return *e.Value.(*pin)
+// slowDial makes d's dials to addr take delay before they connect.
+func slowDial(d *raceDialer, addr string, delay time.Duration) {
+	d.dialer.ControlContext = func(ctx context.Context, _, address string, _ syscall.RawConn) error {
+		if host, _, _ := net.SplitHostPort(address); host == addr {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
 	}
-	return pin{}
+}
+
+// withEntry edits host's cache entry, creating it if needed.
+func withEntry(d *raceDialer, host string, edit func(e *entry)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	edit(d.entryFor(host))
+}
+
+func forget(d *raceDialer, host string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if el, ok := d.entries[host]; ok {
+		d.lru.Remove(el)
+		delete(d.entries, host)
+	}
 }
 
 func TestRaceDialPicksTheAnsweringAddress(t *testing.T) {
@@ -67,7 +93,7 @@ func TestRaceDialPicksTheAnsweringAddress(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("the race took %v, so it waited on the address that never answers", elapsed)
 	}
-	if got := pinOf(d, "race.test").addr; got != netip.MustParseAddr("127.0.0.1") {
+	if got := d.cached("race.test").pin; got != netip.MustParseAddr("127.0.0.1") {
 		t.Fatalf("pinned %v, want the address that answered", got)
 	}
 }
@@ -114,7 +140,7 @@ func TestPinnedAddress(t *testing.T) {
 		}
 		conn.Close()
 	}
-	pinnedFor := func() time.Duration { return time.Until(pinOf(d, "pin.test").until) }
+	pinnedFor := func() time.Duration { return time.Until(d.cached("pin.test").pinUntil) }
 
 	dial()
 	dial()
@@ -125,28 +151,32 @@ func TestPinnedAddress(t *testing.T) {
 		t.Fatalf("pinned for %v, want half the %v TTL", left, ttl)
 	}
 
-	d.pin("pin.test", local, -time.Second)
+	// An expired pin over addresses that are still fresh races them without DNS.
+	withEntry(d, "pin.test", func(e *entry) { e.pinUntil = time.Now().Add(-time.Second) })
 	dial()
-	if races != 2 {
-		t.Fatalf("an expired pin was reused instead of racing again")
+	if races != 1 || pinnedFor() < ttl/2-time.Second {
+		t.Fatalf("an expired pin over fresh addresses was not raced and pinned again without DNS (%d lookups)", races)
 	}
 
 	// Nothing listens on [::1] at this port, so dialing the pin is refused at once.
-	d.pin("pin.test", netip.MustParseAddr("::1"), time.Minute)
+	withEntry(d, "pin.test", func(e *entry) {
+		dead := netip.MustParseAddr("::1")
+		e.addrs, e.pin, e.pinUntil = []netip.Addr{dead}, dead, time.Now().Add(time.Minute)
+	})
 	dial()
-	if races != 3 || pinOf(d, "pin.test").addr != local {
+	if races != 2 || d.cached("pin.test").pin != local {
 		t.Fatalf("a pin that no longer answers was not raced again")
 	}
 
 	ttl = time.Second
-	d.unpin("pin.test")
+	forget(d, "pin.test")
 	dial()
 	if left := pinnedFor(); left > minPin || left < minPin-time.Second {
 		t.Fatalf("pinned for %v with a %v TTL, want the %v minimum", left, ttl, minPin)
 	}
 
 	ttl = time.Hour
-	d.unpin("pin.test")
+	forget(d, "pin.test")
 	dial()
 	if left := pinnedFor(); left > maxPin || left < maxPin-time.Second {
 		t.Fatalf("pinned for %v with a %v TTL, want the %v maximum", left, ttl, maxPin)
@@ -162,7 +192,11 @@ func TestSilentPinRacesAfterAttemptDelay(t *testing.T) {
 		races++
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, time.Minute, nil
 	}
-	d.pin("hole.test", netip.MustParseAddr("192.0.2.1"), time.Minute)
+	withEntry(d, "hole.test", func(e *entry) {
+		hole := netip.MustParseAddr("192.0.2.1")
+		e.addrs, e.ttl, e.expires = []netip.Addr{hole}, time.Minute, time.Now().Add(time.Minute)
+		e.pin, e.pinUntil = hole, time.Now().Add(time.Minute)
+	})
 	start := time.Now()
 	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "hole.test", Port: port})
 	if err != nil {
@@ -173,28 +207,112 @@ func TestSilentPinRacesAfterAttemptDelay(t *testing.T) {
 	if elapsed < attemptDelay || elapsed > attemptDelay+time.Second {
 		t.Fatalf("a silent pin was replaced after %v, want just past the %v attempt delay", elapsed, attemptDelay)
 	}
-	if races != 1 || pinOf(d, "hole.test").addr != netip.MustParseAddr("127.0.0.1") {
+	if races != 1 || d.cached("hole.test").pin != netip.MustParseAddr("127.0.0.1") {
 		t.Fatalf("a silent pin was not replaced by the race's winner")
 	}
 }
 
 func TestPinsEvictLeastRecentlyUsed(t *testing.T) {
 	d := newRaceDialer()
-	addr := netip.MustParseAddr("127.0.0.1")
-	d.pin("first", addr, time.Minute)
+	addrs := []netip.Addr{netip.MustParseAddr("127.0.0.1")}
+	d.remember("first", addrs, time.Minute)
 	for i := 1; i < maxPins; i++ {
-		d.pin(fmt.Sprintf("name%d.test", i), addr, time.Minute)
+		d.remember(fmt.Sprintf("name%d.test", i), addrs, time.Minute)
 	}
-	d.pinnedAddr("first")
-	d.pin("overflow.test", addr, time.Minute)
-	if _, ok := d.pinnedAddr("first"); !ok {
-		t.Fatal("a recently used pin was evicted")
+	d.cached("first")
+	d.remember("overflow.test", addrs, time.Minute)
+	if len(d.cached("first").addrs) == 0 {
+		t.Fatal("a recently used name was evicted")
 	}
-	if _, ok := d.pinnedAddr("name1.test"); ok {
-		t.Fatal("the least recently used pin was kept past the limit")
+	if len(d.cached("name1.test").addrs) != 0 {
+		t.Fatal("the least recently used name was kept past the limit")
 	}
-	if len(d.pinned) != maxPins || d.lru.Len() != maxPins {
-		t.Fatalf("%d pins in the map and %d in the list, want %d", len(d.pinned), d.lru.Len(), maxPins)
+	if len(d.entries) != maxPins || d.lru.Len() != maxPins {
+		t.Fatalf("%d names in the map and %d in the list, want %d", len(d.entries), d.lru.Len(), maxPins)
+	}
+}
+
+func TestStaleAddressesServedWhileRefreshing(t *testing.T) {
+	_, port := localListener(t)
+	local := netip.MustParseAddr("127.0.0.1")
+	var lookups atomic.Int32
+	d := newRaceDialer()
+	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
+		lookups.Add(1)
+		time.Sleep(300 * time.Millisecond)
+		return []netip.Addr{local}, time.Minute, nil
+	}
+	withEntry(d, "stale.test", func(e *entry) {
+		e.addrs, e.ttl, e.expires = []netip.Addr{local}, time.Minute, time.Now().Add(-time.Second)
+	})
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Go(func() {
+			start := time.Now()
+			conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "stale.test", Port: port})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			conn.Close()
+			if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+				t.Errorf("a dial over expired addresses took %v, so it waited for DNS", elapsed)
+			}
+		})
+	}
+	wg.Wait()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && time.Now().After(d.cached("stale.test").expires) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := lookups.Load(); n != 1 || time.Now().After(d.cached("stale.test").expires) {
+		t.Fatalf("%d lookups; want one background refresh that renewed the expired addresses", n)
+	}
+}
+
+func TestCachedAddressesThatAllFailResolveAgain(t *testing.T) {
+	_, port := localListener(t)
+	local := netip.MustParseAddr("127.0.0.1")
+	lookups := 0
+	d := newRaceDialer()
+	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
+		lookups++
+		return []netip.Addr{local}, time.Minute, nil
+	}
+	// The name moved: its cached address, [::1] at this port, refuses.
+	withEntry(d, "moved.test", func(e *entry) {
+		e.addrs, e.ttl, e.expires = []netip.Addr{netip.MustParseAddr("::1")}, time.Minute, time.Now().Add(time.Minute)
+	})
+	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "moved.test", Port: port})
+	if err != nil {
+		t.Fatalf("a name whose cached addresses all fail was not resolved again: %v", err)
+	}
+	conn.Close()
+	if lookups != 1 || !slices.Equal(d.cached("moved.test").addrs, []netip.Addr{local}) {
+		t.Fatalf("%d lookups, cached %v; want one lookup replacing the dead address", lookups, d.cached("moved.test").addrs)
+	}
+}
+
+func TestPinKeptOnlyWhileListed(t *testing.T) {
+	_, port := localListener(t)
+	old := netip.MustParseAddr("127.0.0.1")
+	d := newRaceDialer()
+	slowDial(d, "127.0.0.1", 400*time.Millisecond)
+	// DNS no longer lists the pinned address; [::1] at this port refuses.
+	d.resolve = func(context.Context, string) ([]netip.Addr, time.Duration, error) {
+		return []netip.Addr{netip.MustParseAddr("::1")}, time.Minute, nil
+	}
+	withEntry(d, "old.test", func(e *entry) {
+		e.addrs, e.ttl, e.expires = []netip.Addr{old}, time.Minute, time.Now().Add(time.Minute)
+		e.pin, e.pinUntil = old, time.Now().Add(time.Minute)
+	})
+	conn, err := d.DialContext(context.Background(), proxy.Addr{Domain: "old.test", Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if p := d.cached("old.test").pin; p.IsValid() {
+		t.Fatalf("pinned %v, which DNS no longer lists", p)
 	}
 }
 
