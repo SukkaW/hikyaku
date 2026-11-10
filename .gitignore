@@ -1,0 +1,13 @@
+/dist/
+/build/
+
+# Local test artifacts
+*.pcap
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
