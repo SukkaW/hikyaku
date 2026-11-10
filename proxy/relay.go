@@ -21,21 +21,34 @@ const (
 // smux sends the same FIN for Close and CloseWrite, so the peer cannot tell a
 // half-close from an abort; the first direction to finish therefore tears down
 // both, which keeps a cancelled download from streaming on into a dead stream.
+// A direction that ends in an error rather than a clean end resets the local
+// connection instead, so a response cut off by a dead carrier does not look complete.
 func Relay(local, stream net.Conn) {
 	var once sync.Once
-	closeBoth := func() {
-		local.Close()
-		stream.Close()
+	closeBoth := func(err error) {
+		once.Do(func() {
+			if err != nil {
+				abort(local)
+			}
+			local.Close()
+			stream.Close()
+		})
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		copyDRS(stream, local)
-		once.Do(closeBoth)
+		closeBoth(copyDRS(stream, local))
 	}()
-	io.Copy(local, stream)
-	once.Do(closeBoth)
+	_, err := io.Copy(local, stream)
+	closeBoth(err)
 	<-done
+}
+
+// abort makes conn's Close send a reset instead of a FIN, where conn supports that.
+func abort(conn net.Conn) {
+	if l, ok := conn.(interface{ SetLinger(sec int) error }); ok {
+		l.SetLinger(0)
+	}
 }
 
 func copyDRS(dst io.Writer, src io.Reader) error {

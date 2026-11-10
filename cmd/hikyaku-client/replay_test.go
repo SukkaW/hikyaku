@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"sync/atomic"
@@ -135,4 +136,59 @@ func TestReplay(t *testing.T) {
 		case <-time.After(time.Second):
 		}
 	})
+}
+
+func TestCutOffResponseIsReset(t *testing.T) {
+	key := make([]byte, proxy.PSKSize)
+	rand.Read(key)
+	psk := base64.StdEncoding.EncodeToString(key)
+	p := newPool(startServer(t, psk), []byte(psk), 2)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go (&inbound{pool: p}).serve(ln)
+	client := socksClient{addr: ln.Addr().String()}
+
+	origin, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer origin.Close()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		conn, err := origin.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.Write([]byte("partial"))
+		<-stop
+	}()
+	conn, err := client.DialContext(context.Background(), "tcp", origin.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(conn, make([]byte, len("partial"))); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	var busy *carrier
+	for _, c := range p.carriers {
+		if c != nil && c.session.NumStreams() > 0 {
+			busy = c
+		}
+	}
+	p.mu.Unlock()
+	if busy == nil {
+		t.Fatal("no carrier holds the stream")
+	}
+	busy.conn.Conn.Close()
+	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("read after the carrier died: %v, want a reset rather than a clean end", err)
+	}
 }

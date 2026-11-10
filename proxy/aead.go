@@ -225,6 +225,11 @@ func (c *Conn) Read(b []byte) (int, error) {
 			p, err = c.readChunk()
 		}
 		if err != nil {
+			// smux ends streams with frames of its own, so the carrier itself ending,
+			// even cleanly between chunks, cuts off whatever its streams were sending.
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
 			c.readErr.CompareAndSwap(nil, &err)
 			return 0, err
 		}

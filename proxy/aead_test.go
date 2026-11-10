@@ -89,6 +89,23 @@ func TestHandshakeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCarrierEndIsUnexpected(t *testing.T) {
+	psk := newPSK()
+	clientRaw, serverRaw := tcpPair(t)
+	result := serve(serverRaw, psk, NewReplayFilter())
+	client, err := ClientHandshake(clientRaw, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := <-result; r.err != nil {
+		t.Fatal(r.err)
+	}
+	serverRaw.Close() // the server's end closes cleanly, between chunks
+	if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("read %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
 func TestWrongPSKRejected(t *testing.T) {
 	clientRaw, serverRaw := tcpPair(t)
 	result := serve(serverRaw, newPSK(), NewReplayFilter())

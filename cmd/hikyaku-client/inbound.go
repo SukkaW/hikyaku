@@ -192,3 +192,11 @@ type bufferedConn struct {
 func (c *bufferedConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
+
+// SetLinger lets proxy.Relay reset the app's connection when its stream fails.
+func (c *bufferedConn) SetLinger(sec int) error {
+	if l, ok := c.Conn.(interface{ SetLinger(sec int) error }); ok {
+		return l.SetLinger(sec)
+	}
+	return nil
+}
