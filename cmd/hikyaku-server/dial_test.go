@@ -219,12 +219,12 @@ func TestSilentPinRacesAfterAttemptDelay(t *testing.T) {
 func TestPinsEvictLeastRecentlyUsed(t *testing.T) {
 	d := newRaceDialer()
 	addrs := []netip.Addr{netip.MustParseAddr("127.0.0.1")}
-	d.learn("first", addrs, time.Minute, true)
+	d.learn("first", addrs, time.Minute)
 	for i := 1; i < maxPins; i++ {
-		d.learn(fmt.Sprintf("name%d.test", i), addrs, time.Minute, true)
+		d.learn(fmt.Sprintf("name%d.test", i), addrs, time.Minute)
 	}
 	d.cached("first")
-	d.learn("overflow.test", addrs, time.Minute, true)
+	d.learn("overflow.test", addrs, time.Minute)
 	if len(d.cached("first").addrs) == 0 {
 		t.Fatal("a recently used name was evicted")
 	}
@@ -291,8 +291,103 @@ func TestCachedAddressesThatAllFailResolveAgain(t *testing.T) {
 		t.Fatalf("a name whose cached addresses all fail was not resolved again: %v", err)
 	}
 	conn.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !slices.Equal(d.cached("moved.test").addrs, []netip.Addr{local}) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if n := lookups.Load(); n != 1 || !slices.Equal(d.cached("moved.test").addrs, []netip.Addr{local}) {
 		t.Fatalf("%d lookups, cached %v; want one lookup replacing the dead address", n, d.cached("moved.test").addrs)
+	}
+}
+
+func TestSilentCachedAddressesAskDNS(t *testing.T) {
+	_, port := localListener(t)
+	ttl := time.Minute
+	d := newRaceDialer()
+	blackHole(d, "192.0.2.1")
+	d.resolve = answers([]netip.Addr{netip.MustParseAddr("127.0.0.1")}, &ttl, new(atomic.Int32))
+	// The cached address is fresh and unpinned, but drops every SYN.
+	withEntry(d, "silent.test", func(e *entry) {
+		e.addrs, e.ttl, e.expires = []netip.Addr{netip.MustParseAddr("192.0.2.1")}, time.Minute, time.Now().Add(time.Minute)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	conn, err := d.DialContext(ctx, proxy.Addr{Domain: "silent.test", Port: port})
+	if err != nil {
+		t.Fatalf("a name whose cached address went silent failed: %v", err)
+	}
+	conn.Close()
+	if elapsed := time.Since(start); elapsed < attemptDelay || elapsed > time.Second {
+		t.Fatalf("connected after %v; want DNS asked once the cached address stalled past %v", elapsed, attemptDelay)
+	}
+}
+
+func TestLookupAddsUntilItCompletes(t *testing.T) {
+	old, first, second := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.3")
+	for _, complete := range []bool{true, false} {
+		d := newRaceDialer()
+		release := make(chan struct{})
+		d.resolve = func(_ context.Context, _ string, found func([]netip.Addr, time.Duration)) error {
+			found([]netip.Addr{first}, time.Minute)
+			<-release
+			found([]netip.Addr{second}, time.Minute)
+			if !complete {
+				return context.DeadlineExceeded
+			}
+			return nil
+		}
+		withEntry(d, "add.test", func(e *entry) {
+			e.addrs, e.ttl, e.expires = []netip.Addr{old}, time.Minute, time.Now().Add(time.Minute)
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		r := &race{ctx: ctx, results: make(chan dialResult), tried: make(map[netip.Addr]bool)}
+		done := d.lookup(ctx, "add.test", r)
+		more := r.more
+		<-more
+		if addrs := d.cached("add.test").addrs; !slices.Equal(addrs, []netip.Addr{old, first}) {
+			t.Fatalf("cached %v while the lookup runs; want its first answer added to what was cached", addrs)
+		}
+		close(release)
+		for range more {
+		}
+		<-done
+		cancel()
+		want := []netip.Addr{first, second}
+		if !complete {
+			want = []netip.Addr{old, first, second}
+		}
+		if addrs := d.cached("add.test").addrs; !slices.Equal(addrs, want) {
+			t.Fatalf("complete=%v: cached %v after the lookup, want %v", complete, addrs, want)
+		}
+	}
+}
+
+func TestAnswerForEvictedNameKeepsItsLifetime(t *testing.T) {
+	d := newRaceDialer()
+	d.learn("evicted.test", []netip.Addr{netip.MustParseAddr("192.0.2.1")}, 10*time.Minute)
+	if e := d.cached("evicted.test"); e.ttl != 10*time.Minute || time.Until(e.expires) < 9*time.Minute {
+		t.Fatalf("lifetime %v, expiring in %v; want the answer's 10m", e.ttl, time.Until(e.expires))
+	}
+}
+
+func TestDialReportsLookupError(t *testing.T) {
+	d := newRaceDialer()
+	blackHole(d, "192.0.2.1")
+	d.resolve = func(context.Context, string, func([]netip.Addr, time.Duration)) error {
+		return &net.DNSError{Err: "no such host", Name: "gone.test", IsNotFound: true}
+	}
+	withEntry(d, "gone.test", func(e *entry) {
+		hole := netip.MustParseAddr("192.0.2.1")
+		e.addrs, e.ttl, e.expires = []netip.Addr{hole}, time.Minute, time.Now().Add(time.Minute)
+		e.pin, e.pinUntil = hole, time.Now().Add(time.Minute)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := d.DialContext(ctx, proxy.Addr{Domain: "gone.test", Port: 443})
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+		t.Fatalf("got %v; want the lookup's NXDOMAIN alongside the dial's own failure", err)
 	}
 }
 
