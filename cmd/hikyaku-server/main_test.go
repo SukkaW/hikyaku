@@ -14,6 +14,7 @@ import (
 )
 
 func TestPingAndGoAway(t *testing.T) {
+	t.Cleanup(endShutdown)
 	got := make(chan []byte, 4)
 	c, _ := startCarrier(t, func(cmd byte, body []byte) { got <- append([]byte{cmd}, body...) })
 	next := func(what string) []byte {
@@ -37,6 +38,28 @@ func TestPingAndGoAway(t *testing.T) {
 	goAway()
 	if m := next("GOAWAY"); len(m) < 3 || m[0] != proxy.CtrlGoAway || m[1] != proxy.GoAwayShutdown || int(m[2]) != len(m)-3 {
 		t.Fatalf("got %v, want GOAWAY for a shutdown with its reason", m)
+	}
+}
+
+// endShutdown undoes goAway's flag, so later tests see a running server.
+func endShutdown() {
+	live.Lock()
+	live.goingAway = false
+	live.Unlock()
+}
+
+func TestGoAwayReachesCarriersJoiningDuringShutdown(t *testing.T) {
+	t.Cleanup(endShutdown)
+	goAway()
+	got := make(chan byte, 4)
+	startCarrier(t, func(cmd byte, _ []byte) { got <- cmd })
+	select {
+	case cmd := <-got:
+		if cmd != proxy.CtrlGoAway {
+			t.Fatalf("got control %d, want GOAWAY", cmd)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a carrier that joined during shutdown was not told to go away")
 	}
 }
 

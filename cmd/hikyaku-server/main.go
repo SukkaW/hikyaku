@@ -29,8 +29,14 @@ const (
 // live tracks open carriers, so a server that is shutting down can tell each client.
 var live = struct {
 	sync.Mutex
-	carriers map[*proxy.Conn]*smux.Session
+	carriers  map[*proxy.Conn]*smux.Session
+	goingAway bool
 }{carriers: make(map[*proxy.Conn]*smux.Session)}
+
+var goAwayBody = func() []byte {
+	const reason = "server shutting down"
+	return append([]byte{proxy.GoAwayShutdown, byte(len(reason))}, reason...)
+}()
 
 func main() {
 	listen := flag.String("listen", ":8444", "carrier listen address")
@@ -64,13 +70,12 @@ func main() {
 // goAway tells every client its carriers are going away, then gives their streams up
 // to shutdownGrace to finish.
 func goAway() {
-	const reason = "server shutting down"
-	body := append([]byte{proxy.GoAwayShutdown, byte(len(reason))}, reason...)
 	live.Lock()
+	live.goingAway = true
 	sessions := make([]*smux.Session, 0, len(live.carriers))
 	for c, session := range live.carriers {
 		// A carrier whose writes are stuck must not hold up the others.
-		go c.WriteControl(proxy.CtrlGoAway, body)
+		go c.WriteControl(proxy.CtrlGoAway, goAwayBody)
 		sessions = append(sessions, session)
 	}
 	live.Unlock()
@@ -135,7 +140,12 @@ func serveCarrier(conn net.Conn, psk []byte, replay *proxy.ReplayFilter, out *ou
 	defer session.Close()
 	live.Lock()
 	live.carriers[c] = session
+	// A carrier that finished its handshake after goAway began still has to hear it.
+	goingAway := live.goingAway
 	live.Unlock()
+	if goingAway {
+		go c.WriteControl(proxy.CtrlGoAway, goAwayBody)
+	}
 	defer func() {
 		live.Lock()
 		delete(live.carriers, c)
