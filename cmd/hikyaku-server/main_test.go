@@ -95,3 +95,42 @@ func TestServeSurvivesAcceptErrors(t *testing.T) {
 		t.Fatalf("serve returned %v, want it to keep accepting until the listener closes", err)
 	}
 }
+
+func TestResetBeforeStreamOpens(t *testing.T) {
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	dialed := make(chan struct{}, 1)
+	go func() {
+		if conn, err := target.Accept(); err == nil {
+			conn.Close()
+			dialed <- struct{}{}
+		}
+	}()
+	c, session := startCarrier(t, nil)
+	// smux numbers a client's first stream 3; the RESET goes out ahead of its SYN.
+	if err := c.WriteControl(proxy.CtrlReset, proxy.ResetBody(3, proxy.ResetAborted)); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := session.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.ID() != 3 {
+		t.Fatalf("first stream is %d, want 3", stream.ID())
+	}
+	if _, err := stream.Write(connectTo(t, target.Addr())); err != nil {
+		t.Fatal(err)
+	}
+	stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if n, err := stream.Read(make([]byte, 1)); n != 0 || err == nil || errors.Is(err, smux.ErrTimeout) {
+		t.Fatalf("read %d bytes, %v; want the reset stream closed without an answer", n, err)
+	}
+	select {
+	case <-dialed:
+		t.Fatal("server dialed the destination of a stream the client had reset")
+	case <-time.After(time.Second):
+	}
+}

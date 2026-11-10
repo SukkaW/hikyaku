@@ -75,6 +75,7 @@ type carrier struct {
 	mu         sync.Mutex
 	unanswered map[*replayStream]struct{}
 	waiting    map[*carrierStream]time.Time // streams still waiting for their acknowledgement
+	streams    map[uint32]*carrierStream    // open streams by id, for the server's RESET
 	pings      map[uint32]ping              // pings still waiting for their pong
 	nextPing   uint32
 	quiet      []sample      // round trips of pings sent while quiet, oldest first
@@ -290,6 +291,18 @@ func (c *carrier) control(cmd byte, body []byte) {
 			reason = string(body[2 : 2+int(body[1])])
 		}
 		c.goaway.Store(&reason)
+	case proxy.CtrlReset:
+		if id, _, ok := proxy.ParseReset(body); ok {
+			c.mu.Lock()
+			s := c.streams[id]
+			c.mu.Unlock()
+			if s != nil {
+				// Marked here, before smux reads the FIN that follows the RESET.
+				s.reset.Store(true)
+				// Closing writes a FIN, which must not block this reading goroutine.
+				go s.Stream.Close()
+			}
+		}
 	}
 }
 
@@ -762,6 +775,7 @@ type carrierStream struct {
 	opened    time.Time
 	requested atomic.Int64 // unix nanoseconds of the first write, which carries the request
 	answered  bool         // only touched by the single reader
+	reset     atomic.Bool  // the server reset the stream; its reads then fail with proxy.ErrReset
 }
 
 func (c *carrier) newStream(s *smux.Stream) *carrierStream {
@@ -771,6 +785,10 @@ func (c *carrier) newStream(s *smux.Stream) *carrierStream {
 		c.waiting = make(map[*carrierStream]time.Time)
 	}
 	c.waiting[cs] = cs.opened
+	if c.streams == nil {
+		c.streams = make(map[uint32]*carrierStream)
+	}
+	c.streams[s.ID()] = cs
 	c.mu.Unlock()
 	return cs
 }
@@ -780,7 +798,12 @@ func (s *carrierStream) Write(b []byte) (int, error) {
 	return s.Stream.Write(b)
 }
 
-func (s *carrierStream) Read(b []byte) (int, error) {
+func (s *carrierStream) Read(b []byte) (n int, err error) {
+	defer func() {
+		if err != nil && s.reset.Load() {
+			err = proxy.ErrReset
+		}
+	}()
 	if !s.answered {
 		if err := proxy.ReadAck(s.Stream); err != nil {
 			return 0, err
@@ -797,9 +820,17 @@ func (s *carrierStream) Read(b []byte) (int, error) {
 func (s *carrierStream) Close() error {
 	s.c.mu.Lock()
 	delete(s.c.waiting, s)
+	delete(s.c.streams, s.ID())
 	s.c.mu.Unlock()
 	s.c.lastStream.Store(time.Now().UnixNano())
 	return s.Stream.Close()
+}
+
+// Abort resets the server's end of the stream too. It writes the RESET before the
+// relay closes the stream, so it reaches the server ahead of the stream's FIN; a
+// carrier whose writes are stuck holds the relay until the pool closes it.
+func (s *carrierStream) Abort() {
+	s.c.conn.WriteControl(proxy.CtrlReset, proxy.ResetBody(s.ID(), proxy.ResetAborted))
 }
 
 func (c *carrier) acknowledged(s *carrierStream, rtt time.Duration) {

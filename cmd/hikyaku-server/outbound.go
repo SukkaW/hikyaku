@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	"github.com/xtaci/smux"
 )
 
 const (
@@ -26,7 +25,7 @@ func newOutbound() *outbound {
 	return &outbound{dialer: net.Dialer{Timeout: dialTimeout}}
 }
 
-func (o *outbound) handle(stream *smux.Stream) {
+func (o *outbound) handle(stream net.Conn) {
 	defer stream.Close()
 	stream.SetReadDeadline(time.Now().Add(headerTimeout))
 	destination, udp, err := proxy.ReadRequest(stream)

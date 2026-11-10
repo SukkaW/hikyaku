@@ -42,6 +42,8 @@ type replayStream struct {
 	flush   *time.Timer
 	sent    []byte
 	replays int
+	// writeClosed records that the app half-closed, so a replay half-closes again.
+	writeClosed bool
 }
 
 func newReplayStream(h *inbound, destination proxy.Addr) (*replayStream, error) {
@@ -170,6 +172,9 @@ func (r *replayStream) replayLocked(s *carrierStream) bool {
 	if err := r.attach(); err != nil {
 		return false
 	}
+	if r.writeClosed {
+		r.stream.Load().CloseWrite()
+	}
 	if r.closed.Load() {
 		// Close ran while the stream moved; attach tracked it on the new carrier.
 		r.carrier.Load().untrack(r)
@@ -217,6 +222,24 @@ func (r *replayStream) Close() error {
 	r.carrier.Load().untrack(r)
 	return r.stream.Load().Close()
 }
+
+// CloseWrite half-closes the stream, sending first a request that is still waiting
+// for the app's first bytes.
+func (r *replayStream) CloseWrite() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.writeClosed = true
+	s := r.stream.Load()
+	if r.request != nil {
+		r.flush.Stop()
+		// A failed write shows up on the stream's next Read.
+		s.Write(r.request)
+		r.request = nil
+	}
+	return s.CloseWrite()
+}
+
+func (r *replayStream) Abort() { r.stream.Load().Abort() }
 
 func (r *replayStream) LocalAddr() net.Addr               { return r.stream.Load().LocalAddr() }
 func (r *replayStream) RemoteAddr() net.Addr              { return r.stream.Load().RemoteAddr() }

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -17,18 +18,20 @@ const (
 	drsIdleReset = time.Second
 )
 
-// Relay copies between a local connection and a carrier stream, then closes both.
-// smux sends the same FIN for Close and CloseWrite, so the peer cannot tell a
-// half-close from an abort; the first direction to finish therefore tears down
-// both, which keeps a cancelled download from streaming on into a dead stream.
-// A direction that ends in an error rather than a clean end resets the local
-// connection instead, so a response cut off by a dead carrier does not look complete.
+// Relay copies between a local connection and a carrier stream until both directions
+// end. A direction that ends cleanly half-closes where it was going, so the other
+// keeps flowing; one that ends in an error resets the local connection and, through
+// stream's Abort, the peer's end, so a cut-off transfer never looks complete. A
+// cancelled download stops too: the next write to the closed app fails.
 func Relay(local, stream net.Conn) {
 	var once sync.Once
-	closeBoth := func(err error) {
+	end := func(err error) {
 		once.Do(func() {
 			if err != nil {
 				abort(local)
+				if s, ok := stream.(interface{ Abort() }); ok && !errors.Is(err, ErrReset) {
+					s.Abort()
+				}
 			}
 			local.Close()
 			stream.Close()
@@ -37,11 +40,25 @@ func Relay(local, stream net.Conn) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		closeBoth(copyDRS(stream, local))
+		if err := copyDRS(stream, local); err != nil {
+			end(err)
+		} else {
+			closeWrite(stream)
+		}
 	}()
-	_, err := io.Copy(local, stream)
-	closeBoth(err)
+	if _, err := io.Copy(local, stream); err != nil {
+		end(err)
+	} else {
+		closeWrite(local)
+	}
 	<-done
+	end(nil)
+}
+
+func closeWrite(conn net.Conn) {
+	if c, ok := conn.(interface{ CloseWrite() error }); ok {
+		c.CloseWrite()
+	}
 }
 
 // abort makes conn's Close send a reset instead of a FIN, where conn supports that.

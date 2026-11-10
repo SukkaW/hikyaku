@@ -206,3 +206,11 @@ func (c *bufferedConn) SetLinger(sec int) error {
 	}
 	return nil
 }
+
+// CloseWrite lets proxy.Relay half-close the app's connection.
+func (c *bufferedConn) CloseWrite() error {
+	if w, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return w.CloseWrite()
+	}
+	return nil
+}

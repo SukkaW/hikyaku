@@ -24,15 +24,38 @@ const (
 
 // Carrier control messages travel outside smux (see Conn.WriteControl). The client
 // pings, the server answers with a pong echoing the ping's 4-byte id, and the server
-// sends GOAWAY, [code][length][reason], before it stops serving a carrier.
+// sends GOAWAY, [code][length][reason], before it stops serving a carrier. Either
+// side sends RESET, [stream id][code], when a stream ends in an error: smux sends the
+// same FIN for a close and a half-close, so a FIN only ever ends one direction.
 const (
 	CtrlPing   byte = 0x01
 	CtrlPong   byte = 0x02
 	CtrlGoAway byte = 0x03
+	CtrlReset  byte = 0x04
 )
 
 // GoAwayShutdown is the GOAWAY code for a server that is shutting down.
 const GoAwayShutdown byte = 1
+
+// ResetAborted is the RESET code for a stream whose app or destination connection
+// ended in an error.
+const ResetAborted byte = 1
+
+// ErrReset is what reading a stream returns once the peer has reset it.
+var ErrReset = errors.New("stream reset by peer")
+
+// ResetBody is the body of a RESET for stream id.
+func ResetBody(id uint32, code byte) []byte {
+	return append(binary.BigEndian.AppendUint32(nil, id), code)
+}
+
+// ParseReset reads the body of a RESET.
+func ParseReset(body []byte) (id uint32, code byte, ok bool) {
+	if len(body) != 5 {
+		return 0, 0, false
+	}
+	return binary.BigEndian.Uint32(body), body[4], true
+}
 
 // Result codes a server reports after trying the destination.
 const (

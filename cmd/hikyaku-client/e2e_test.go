@@ -233,6 +233,116 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("read %q, %v; want the answer that arrived while the upload was blocked", got, err)
 		}
 	})
+
+	t.Run("half-close keeps the response", func(t *testing.T) {
+		origin, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer origin.Close()
+		go func() {
+			conn, err := origin.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			request, _ := io.ReadAll(conn) // until the app half-closes
+			conn.Write(append([]byte("got "), request...))
+		}()
+		conn, err := client.DialContext(context.Background(), "tcp", origin.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if got, err := io.ReadAll(conn); err != nil || string(got) != "got ping" {
+			t.Fatalf("read %q, %v; want the answer to a request the app half-closed after", got, err)
+		}
+	})
+
+	// A reset discards data not yet read, so each side resets only once the other has
+	// read what came before it.
+	t.Run("destination reset reaches the app", func(t *testing.T) {
+		origin, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer origin.Close()
+		read := make(chan struct{})
+		go func() {
+			conn, err := origin.Accept()
+			if err != nil {
+				return
+			}
+			conn.Write([]byte("partial"))
+			<-read
+			conn.(*net.TCPConn).SetLinger(0)
+			conn.Close()
+		}()
+		conn, err := client.DialContext(context.Background(), "tcp", origin.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if _, err := io.ReadFull(conn, make([]byte, len("partial"))); err != nil {
+			t.Fatal(err)
+		}
+		close(read)
+		if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, io.EOF) {
+			t.Fatalf("read after the destination reset: %v, want a reset rather than a clean end", err)
+		}
+	})
+
+	t.Run("app reset reaches the destination", func(t *testing.T) {
+		origin, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer origin.Close()
+		read := make(chan struct{})
+		ended := make(chan error, 1)
+		go func() {
+			conn, err := origin.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+				ended <- err
+				return
+			}
+			close(read)
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_, err = conn.Read(make([]byte, 1))
+			ended <- err
+		}()
+		conn, err := client.DialContext(context.Background(), "tcp", origin.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-read:
+		case err := <-ended:
+			t.Fatalf("destination never got the app's first byte: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("destination never got the app's first byte")
+		}
+		conn.(*net.TCPConn).SetLinger(0)
+		conn.Close()
+		if err := <-ended; err == nil || errors.Is(err, io.EOF) {
+			t.Fatalf("destination read after the app reset: %v, want a reset rather than a clean end", err)
+		}
+	})
 }
 
 func TestUDPIdle(t *testing.T) {
