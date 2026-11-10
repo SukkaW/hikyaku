@@ -89,6 +89,7 @@ type Conn struct {
 	seal      cipher.AEAD
 	sealNonce [12]byte
 	wbuf      []byte
+	wlen      [2]byte
 
 	psk        []byte
 	clientSalt []byte
@@ -264,7 +265,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
-			c.readErr.CompareAndSwap(nil, &err)
+			// Storing &err would move err to the heap on every read that fetches a chunk.
+			stored := err
+			c.readErr.CompareAndSwap(nil, &stored)
 			return 0, err
 		}
 		c.pending = p
@@ -318,9 +321,8 @@ func (c *Conn) writeWithPrefix(prefix, b []byte, flag uint16) error {
 	c.wbuf = append(c.wbuf[:0], prefix...)
 	for len(b) > 0 {
 		n := min(len(b), maxChunk)
-		var length [2]byte
-		binary.BigEndian.PutUint16(length[:], uint16(n)|flag)
-		c.wbuf = c.seal.Seal(c.wbuf, c.sealNonce[:], length[:], nil)
+		binary.BigEndian.PutUint16(c.wlen[:], uint16(n)|flag)
+		c.wbuf = c.seal.Seal(c.wbuf, c.sealNonce[:], c.wlen[:], nil)
 		increment(&c.sealNonce)
 		c.wbuf = c.seal.Seal(c.wbuf, c.sealNonce[:], b[:n], nil)
 		increment(&c.sealNonce)
