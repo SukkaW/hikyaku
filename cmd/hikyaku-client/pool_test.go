@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -345,6 +346,71 @@ func TestDataKeepsCarrierAlive(t *testing.T) {
 			t.Fatal("the carrier kept its slot after its data stopped as well")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// pingServer answers pings like the real server, except the ones drop picks, which it
+// discards as the real server does when its pong queue is full.
+func pingServer(t *testing.T, psk string, drop func(id uint32) bool) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { conn.Close() })
+			go func() {
+				c, err := proxy.ServerHandshake(conn, []byte(psk), proxy.NewReplayFilter())
+				if err != nil {
+					return
+				}
+				pongs := make(chan []byte, 64)
+				c.OnControl(func(cmd byte, body []byte) {
+					if cmd == proxy.CtrlPing && !drop(binary.BigEndian.Uint32(body)) {
+						pongs <- bytes.Clone(body)
+					}
+				})
+				if _, err := smux.Server(c, proxy.MuxConfig()); err != nil {
+					return
+				}
+				for id := range pongs {
+					if c.WriteControl(proxy.CtrlPong, id) != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestDroppedPingsKeepCarrier(t *testing.T) {
+	psk := "dropped-pings-test"
+	p := newPool(pingServer(t, psk, func(id uint32) bool { return id < 3 }), []byte(psk), 1)
+	p.warm()
+	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
+	p.mu.Lock()
+	c := p.carriers[0]
+	p.mu.Unlock()
+	// An open stream keeps the carrier warm, so it is pinged every 0.5 s.
+	if _, err := c.session.OpenStream(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(maxReplyDeadline + 2*healthCheck + time.Second)
+	if n := len(p.standing()); n != 0 {
+		t.Fatalf("%d carriers on standby; the server dropped three pings but answers the rest", n)
+	}
+	c.mu.Lock()
+	outstanding := len(c.pings)
+	c.mu.Unlock()
+	if outstanding > 1 {
+		t.Fatalf("%d pings still outstanding, want the dropped ones forgotten", outstanding)
 	}
 }
 

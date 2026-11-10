@@ -260,6 +260,13 @@ func (c *carrier) control(cmd byte, body []byte) {
 		c.mu.Lock()
 		pg, ok := c.pings[id]
 		delete(c.pings, id)
+		// The server answers pings in order and drops them when it falls behind, so an
+		// older ping still waiting will never be answered.
+		for older := range c.pings {
+			if older < id {
+				delete(c.pings, older)
+			}
+		}
 		if ok && pg.quiet {
 			c.quiet = append(c.quiet, sample{time.Now(), time.Since(pg.sent)})
 			if len(c.quiet) > quietSamples {
