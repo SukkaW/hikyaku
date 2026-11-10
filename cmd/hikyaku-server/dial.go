@@ -4,15 +4,12 @@ import (
 	"container/list"
 	"context"
 	"errors"
-	"math"
 	"net"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	"github.com/miekg/dns"
 )
 
 const (
@@ -53,7 +50,7 @@ type dialResult struct {
 func newRaceDialer() *raceDialer {
 	return &raceDialer{
 		dialer:  net.Dialer{Timeout: dialTimeout},
-		resolve: lookup,
+		resolve: lookupOS,
 		pinned:  make(map[string]*list.Element),
 	}
 }
@@ -198,79 +195,4 @@ func (d *raceDialer) unpin(host string) {
 		d.lru.Remove(e)
 		delete(d.pinned, host)
 	}
-}
-
-var resolvConf = sync.OnceValue(func() *dns.ClientConfig {
-	conf, err := dns.ClientConfigFromFile("/etc/resolv.conf")
-	if err != nil {
-		return nil
-	}
-	return conf
-})
-
-// lookup resolves host with the TTL of its records. Go's resolver reports no TTL, so
-// the nameservers in /etc/resolv.conf are asked directly; when they give no answer,
-// Go's resolver still covers single-label names and the hosts file, with no TTL.
-func lookup(ctx context.Context, host string) ([]netip.Addr, time.Duration, error) {
-	if conf := resolvConf(); conf != nil && strings.Contains(host, ".") {
-		if addrs, ttl := lookupDNS(ctx, conf, host); len(addrs) > 0 {
-			return addrs, ttl, nil
-		}
-	}
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	for i := range addrs {
-		addrs[i] = addrs[i].Unmap()
-	}
-	return addrs, 0, err
-}
-
-// lookupDNS asks for host's A and AAAA records at once and returns their addresses
-// with the shortest TTL in either answer, CNAMEs included.
-func lookupDNS(ctx context.Context, conf *dns.ClientConfig, host string) ([]netip.Addr, time.Duration) {
-	var (
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		addrs []netip.Addr
-		ttl   uint32 = math.MaxUint32
-	)
-	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
-		wg.Go(func() {
-			answer := exchange(ctx, conf, dns.Fqdn(host), qtype)
-			mu.Lock()
-			defer mu.Unlock()
-			for _, rr := range answer {
-				var ip net.IP
-				switch rr := rr.(type) {
-				case *dns.A:
-					ip = rr.A
-				case *dns.AAAA:
-					ip = rr.AAAA
-				}
-				ttl = min(ttl, rr.Header().Ttl)
-				if addr, ok := netip.AddrFromSlice(ip); ok {
-					addrs = append(addrs, addr.Unmap())
-				}
-			}
-		})
-	}
-	wg.Wait()
-	return addrs, time.Duration(ttl) * time.Second
-}
-
-// exchange asks conf's nameservers in turn and returns the first successful answer.
-func exchange(ctx context.Context, conf *dns.ClientConfig, name string, qtype uint16) []dns.RR {
-	m := new(dns.Msg)
-	m.SetQuestion(name, qtype)
-	m.SetEdns0(1232, false)
-	for _, server := range conf.Servers {
-		addr := net.JoinHostPort(server, conf.Port)
-		r, _, err := new(dns.Client).ExchangeContext(ctx, m, addr)
-		if err == nil && r.Truncated {
-			r, _, err = (&dns.Client{Net: "tcp"}).ExchangeContext(ctx, m, addr)
-		}
-		if err == nil && r.Rcode == dns.RcodeSuccess {
-			return r.Answer
-		}
-	}
-	return nil
 }

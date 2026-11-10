@@ -41,10 +41,23 @@ var goAwayBody = func() []byte {
 func main() {
 	listen := flag.String("listen", ":8444", "carrier listen address")
 	psk := flag.String("psk", "", "pre-shared key, any string")
+	var servers []string
+	flag.Func("dns", "DNS server for destinations, repeatable: an IP, or a udp://, tcp://, tls://, https://, quic://, h3:// or sdns:// address (default: the system resolver)", func(s string) error {
+		servers = append(servers, s)
+		return nil
+	})
 	flag.Parse()
 
 	if *psk == "" {
 		log.Fatal("-psk is required")
+	}
+	out := newOutbound()
+	if len(servers) > 0 {
+		r, err := newDNSResolver(servers)
+		if err != nil {
+			log.Fatal(err)
+		}
+		out.dialer.resolve = r.lookup
 	}
 
 	ln, err := net.Listen("tcp", *listen)
@@ -60,7 +73,7 @@ func main() {
 		goAway()
 		os.Exit(0)
 	}()
-	if err := serve(ln, []byte(*psk), newOutbound()); !errors.Is(err, net.ErrClosed) {
+	if err := serve(ln, []byte(*psk), out); !errors.Is(err, net.ErrClosed) {
 		log.Fatal(err)
 	}
 	// The listener closed on a signal; the handler exits once carriers have gone away.

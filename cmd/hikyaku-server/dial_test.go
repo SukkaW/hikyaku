@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/SukkaW/hikyaku/proxy"
-	"github.com/miekg/dns"
 )
 
 func localListener(t *testing.T) (net.Listener, uint16) {
@@ -196,35 +195,6 @@ func TestPinsEvictLeastRecentlyUsed(t *testing.T) {
 	}
 	if len(d.pinned) != maxPins || d.lru.Len() != maxPins {
 		t.Fatalf("%d pins in the map and %d in the list, want %d", len(d.pinned), d.lru.Len(), maxPins)
-	}
-}
-
-func TestLookupDNS(t *testing.T) {
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		if q := r.Question[0]; q.Qtype == dns.TypeA {
-			m.Answer = append(m.Answer,
-				&dns.CNAME{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 30}, Target: "target.test."},
-				&dns.A{Hdr: dns.RR_Header{Name: "target.test.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("192.0.2.7")},
-			)
-		}
-		w.WriteMsg(m)
-	})}
-	go srv.ActivateAndServe()
-	t.Cleanup(func() { srv.Shutdown() })
-
-	host, port, _ := net.SplitHostPort(pc.LocalAddr().String())
-	addrs, ttl := lookupDNS(context.Background(), &dns.ClientConfig{Servers: []string{host}, Port: port}, "name.test")
-	if len(addrs) != 1 || addrs[0] != netip.MustParseAddr("192.0.2.7") {
-		t.Fatalf("addresses %v, want [192.0.2.7]", addrs)
-	}
-	if ttl != 30*time.Second {
-		t.Fatalf("TTL %v, want the CNAME's shorter 30s", ttl)
 	}
 }
 

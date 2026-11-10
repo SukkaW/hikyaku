@@ -41,6 +41,7 @@ hikyaku-server -psk 'your-psk'
 | --------- | ---------- | ------------------------------------------------ |
 | `-listen` | `:8444`    | Address to listen on for clients                 |
 | `-psk`    | (required) | Pre-shared key; the client must use the same one |
+| `-dns` | the system resolver | DNS server for destinations; repeat it to use several. An IP, or a `udp://`, `tcp://`, `tls://`, `https://`, `quic://`, `h3://` or `sdns://` address. The server's hosts file is still checked first |
 
 On Linux, the server uses BBR congestion control when the kernel provides it (for example after `modprobe tcp_bbr`); otherwise it logs a warning and uses the system default.
 
