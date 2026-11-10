@@ -334,7 +334,7 @@ func (c *carrier) sendPings() {
 }
 
 func (c *carrier) ping(now time.Time) {
-	quiet := now.Sub(c.conn.LastData()) >= quietAfter && now.Sub(c.conn.LastSent()) >= quietAfter
+	quiet := !c.conn.ReceivingData() && now.Sub(c.conn.LastData()) >= quietAfter && now.Sub(c.conn.LastSent()) >= quietAfter
 	select {
 	case c.pingNow <- quiet:
 	default:

@@ -91,15 +91,19 @@ func TestHandshakeRoundTrip(t *testing.T) {
 	}
 }
 
-// writeChunk seals payload as one data chunk of any length, as another sender may.
-func writeChunk(c *Conn, payload []byte) error {
+// sealChunk seals payload as one data chunk of any length, as another sender may.
+func sealChunk(c *Conn, payload []byte) []byte {
 	var length [2]byte
 	binary.BigEndian.PutUint16(length[:], uint16(len(payload)))
 	buf := c.seal.Seal(nil, c.sealNonce[:], length[:], nil)
 	increment(&c.sealNonce)
 	buf = c.seal.Seal(buf, c.sealNonce[:], payload, nil)
 	increment(&c.sealNonce)
-	_, err := c.Conn.Write(buf)
+	return buf
+}
+
+func writeChunk(c *Conn, payload []byte) error {
+	_, err := c.Conn.Write(sealChunk(c, payload))
 	return err
 }
 
@@ -124,6 +128,48 @@ func TestLongestChunkAccepted(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatal("payload mismatch")
+	}
+}
+
+func TestReceivingData(t *testing.T) {
+	psk := newPSK()
+	clientRaw, serverRaw := tcpPair(t)
+	result := serve(serverRaw, psk, NewReplayFilter())
+	client, err := ClientHandshake(clientRaw, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := <-result
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	payload := make([]byte, 1000)
+	rand.Read(payload)
+	chunk := sealChunk(client, payload)
+	half := len(chunk) / 2
+	if _, err := clientRaw.Write(chunk[:half]); err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(r.conn, make([]byte, len(payload)))
+		read <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for !r.conn.ReceivingData() {
+		if time.Now().After(deadline) {
+			t.Fatal("a half-arrived data chunk does not show as receiving")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := clientRaw.Write(chunk[half:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-read; err != nil {
+		t.Fatal(err)
+	}
+	if r.conn.ReceivingData() {
+		t.Fatal("still receiving after the whole chunk arrived")
 	}
 }
 

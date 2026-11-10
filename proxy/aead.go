@@ -99,7 +99,9 @@ type Conn struct {
 	lastRead atomic.Int64 // unix nanoseconds of the last authenticated chunk
 	lastData atomic.Int64 // unix nanoseconds of the last chunk carrying smux data
 	lastSent atomic.Int64 // unix nanoseconds of the last smux data written
-	readErr  atomic.Pointer[error]
+	// receiving is set while a smux data chunk's payload is still arriving.
+	receiving atomic.Bool
+	readErr   atomic.Pointer[error]
 }
 
 // ClientHandshake sends the client salt and hello and returns at once, so streams
@@ -214,6 +216,12 @@ func (c *Conn) LastRead() time.Time {
 // do not count.
 func (c *Conn) LastData() time.Time {
 	return time.Unix(0, c.lastData.Load())
+}
+
+// ReceivingData reports whether a chunk of smux data is partly received, which
+// LastData only shows once the whole chunk has arrived.
+func (c *Conn) ReceivingData() bool {
+	return c.receiving.Load()
 }
 
 // LastSent reports when smux data was last written; control messages do not count.
@@ -356,7 +364,10 @@ func (c *Conn) readChunk() ([]byte, error) {
 			return nil, fmt.Errorf("invalid chunk length %d", n)
 		}
 		payload := c.rbuf[:n+overhead]
-		if _, err := io.ReadFull(c.r, payload); err != nil {
+		c.receiving.Store(!control)
+		_, err = io.ReadFull(c.r, payload)
+		c.receiving.Store(false)
+		if err != nil {
 			return nil, err
 		}
 		plain, err := c.open.Open(payload[:0], c.openNonce[:], payload, nil)
