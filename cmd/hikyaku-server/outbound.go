@@ -17,11 +17,11 @@ const (
 )
 
 type outbound struct {
-	dialer net.Dialer
+	dialer *raceDialer
 }
 
 func newOutbound() *outbound {
-	return &outbound{dialer: net.Dialer{Timeout: dialTimeout}}
+	return &outbound{dialer: newRaceDialer()}
 }
 
 func (o *outbound) handle(stream net.Conn) {
@@ -40,7 +40,7 @@ func (o *outbound) handle(stream net.Conn) {
 		o.relayUDP(stream)
 		return
 	}
-	conn, err := o.dialer.DialContext(context.Background(), "tcp", destination.String())
+	conn, err := o.dialer.DialContext(context.Background(), destination)
 	if err != nil {
 		log.Printf("dial %s: %v", destination, err)
 		proxy.WriteResult(stream, resultCode(err), err.Error())
