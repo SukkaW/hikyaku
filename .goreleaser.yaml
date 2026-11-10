@@ -67,6 +67,7 @@ brews:
     commit_author:
       name: SukkaBot
       email: "{{ .Env.HOMEBREW_GIT_MAIL }}"
+    skip_upload: auto
     directory: Formula
     homepage: https://github.com/SukkaW/hikyaku
     description: A high-performance multiplexing proxy that stays lightning fast and highly reliable everywhere,<br />from fiber broadband to lossy in-flight Wi-Fi.
