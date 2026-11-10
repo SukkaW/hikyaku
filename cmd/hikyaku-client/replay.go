@@ -171,6 +171,8 @@ func (r *replayStream) replayLocked(s *carrierStream) bool {
 		return false
 	}
 	if r.closed.Load() {
+		// Close ran while the stream moved; attach tracked it on the new carrier.
+		r.carrier.Load().untrack(r)
 		r.stream.Load().Close()
 		return false
 	}
