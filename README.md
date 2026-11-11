@@ -86,17 +86,17 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 
 ## Surge for Mac
 
-Surge can start the client itself as an [External Proxy Program](https://manual.nssurge.com/policies/external.html):
+Installing the hikyaku client with [Homebrew](#homebrew) is recommended. Surge can then start hikyaku client as an [External Proxy Program](https://manual.nssurge.com/policies/external.html):
 
 ```ini
 [Proxy]
-hikyaku = external, exec = "/path/to/hikyaku-client", args = "-listen", args = "127.0.0.1:11080", args = "-server", args = "203.0.113.10:8444", args = "-psk", args = "your-psk", local-port = 11080, addresses = 203.0.113.10, udp-relay = true
+hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen", args = "127.0.0.1:11080", args = "-server", args = "203.0.113.10:8444", args = "-psk", args = "your-psk", local-port = 11080, addresses = 203.0.113.10, udp-relay = true
 ```
 
-- `exec` is the full path to `hikyaku-client`; after `go install`, it is in `GOBIN`, or in `bin` under the first `GOPATH` entry when `GOBIN` is unset.
+- `exec` is the full path to `hikyaku-client`. With Homebrew it is `/opt/homebrew/bin/hikyaku-client` on Apple silicon Macs (and `/usr/local/bin/hikyaku-client` on Intel Macs).
 - `local-port` must match the port of the client's `-listen`.
 - `addresses` takes the server's IP address, not a hostname.
-- `udp-relay = true` sends UDP through hikyaku as well.
+- `udp-relay = true` allows hikyaku to relay Surge's UDP traffic as well.
 
 # License
 
