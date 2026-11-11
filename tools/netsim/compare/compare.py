@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Compare hikyaku, satmux and TUIC v5 over netsim's emulated paths.
+"""Compare hikyaku, satmux and TUIC v5 over netsim's emulated paths, with a direct
+connection to the test website, through no proxy, as a reference.
 
 Run as root on Linux (see tools/netsim/Dockerfile). Every system gets its own netsim
 instance per profile, with its server and the test website in that instance's server
@@ -15,8 +16,8 @@ lane of their own alongside.
 
 Every system's client starts START_OFFSET_S after its netsim is ready, so seeded
 outages and spikes reach each system at the same point in its test, and TUIC uses the
-congestion control the kernel gives hikyaku's server. --repeat runs everything again
-with fresh seeds and reports medians with their range.
+congestion control the kernel gives hikyaku's server, on both its client and server.
+--repeat runs everything again with fresh seeds and reports medians with their range.
 """
 import argparse
 import concurrent.futures
@@ -160,6 +161,14 @@ def wait_listening(run, proto, port, timeout=10):
     raise RuntimeError(f"{run.system} server is not listening on {proto} port {port} after {timeout}s")
 
 
+def via(run, socks):
+    """curl arguments that send a request through socks, or, with no socks, straight to
+    the test website over the emulated path."""
+    if socks:
+        return ["--socks5-hostname", socks]
+    return ["--resolve", f"localhost:9443:{run.server}", "--resolve", f"localhost:9001:{run.server}"]
+
+
 def congestion_control(run):
     """The algorithm hikyaku's server gets: BBR when the kernel offers it, since hikyaku
     asks for it, otherwise the kernel's default, which satmux always uses."""
@@ -172,7 +181,7 @@ def congestion_control(run):
 
 def curl(run, socks, url, max_time):
     cmd = ["ip", "netns", "exec", run.client_ns, "curl", "-sS", "-o", "/dev/null", "-w", "%{time_total} %{size_download}",
-           "--max-time", str(max_time), "--cacert", os.path.join(opts.certs, "ca.pem"), "--socks5-hostname", socks, url]
+           "--max-time", str(max_time), "--cacert", os.path.join(opts.certs, "ca.pem"), *via(run, socks), url]
     r = subprocess.run(cmd, capture_output=True, text=True, env=ENV, timeout=max_time + 15)
     parts = r.stdout.split()
     seconds = float(parts[0]) if parts else None
@@ -184,7 +193,7 @@ def first_byte(run, socks, url, max_time):
     """Fetch url and return whether it worked, the time to first byte and the total."""
     cmd = ["ip", "netns", "exec", run.client_ns, "curl", "-sS", "-o", "/dev/null", "-w",
            "%{time_starttransfer} %{time_total}", "--max-time", str(max_time), "--cacert",
-           os.path.join(opts.certs, "ca.pem"), "--socks5-hostname", socks, url]
+           os.path.join(opts.certs, "ca.pem"), *via(run, socks), url]
     r = subprocess.run(cmd, capture_output=True, text=True, env=ENV, timeout=max_time + 15)
     parts = r.stdout.split()
     if r.returncode != 0 or len(parts) != 2:
@@ -249,7 +258,8 @@ def tuic(run, cc):
     with open(server_toml, "w") as f:
         f.write(f'log_level = "info"\nserver = "{run.server}:7444"\n[users]\n"{uuid}" = "{password}"\n'
                 f'[tls]\ncertificate = "{opts.certs}/leaf.pem"\nprivate_key = "{opts.certs}/leaf.key"\n'
-                f'alpn = ["h3"]\nhostname = "localhost"\n[experimental]\ndrop_loopback = false\n')
+                f'alpn = ["h3"]\nhostname = "localhost"\n[experimental]\ndrop_loopback = false\n'
+                f'[backend.quinn.congestion_control]\ncontroller = "{congestion.replace("_", "")}"\n')
     with open(client_toml, "w") as f:
         f.write(f'log_level = "info"\n[relay]\nserver = "localhost:7444"\nip = "{run.server}"\nuuid = "{uuid}"\n'
                 f'password = "{password}"\ncertificates = ["{opts.certs}/ca.pem"]\nalpn = ["h3"]\n'
@@ -260,7 +270,12 @@ def tuic(run, cc):
     return lambda: spawn(run, client, "tuic-client", "client"), "127.0.0.1:1082", congestion
 
 
-SYSTEMS = {"hikyaku": hikyaku, "satmux": satmux, "tuic": tuic}
+def direct(run, cc):
+    """No proxy: curl reaches the test website itself, whose TCP uses the kernel's default."""
+    return lambda: None, None, cc[1]
+
+
+SYSTEMS = {"hikyaku": hikyaku, "satmux": satmux, "tuic": tuic, "direct": direct}
 
 
 def measure(run, start_client, socks, size):
@@ -316,7 +331,7 @@ def measure(run, start_client, socks, size):
     # Twice the timed size, so the link stays busy through the small fetches.
     background = subprocess.Popen(
         ["ip", "netns", "exec", run.client_ns, "curl", "-sS", "-o", "/dev/null", "--max-time", str(2 * BULK_LIMIT_S),
-         "--socks5-hostname", socks, BIG.format(2 * size)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+         *via(run, socks), BIG.format(2 * size)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env=ENV, start_new_session=True)
     time.sleep(2)
     loaded = [curl(run, socks, SMALL, 30) for _ in range(3)]

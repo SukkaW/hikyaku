@@ -1,6 +1,6 @@
-# Runs tools/netsim/compare/compare.py: hikyaku, satmux and TUIC v5 over netsim's
-# emulated paths. Build from the repository root; the container needs TUN and
-# network namespaces, which --privileged grants:
+# Runs tools/netsim/compare/compare.py: hikyaku, satmux, TUIC v5 and a direct
+# connection over netsim's emulated paths. Build from the repository root; the
+# container needs TUN and network namespaces, which --privileged grants:
 #
 #   docker build -f tools/netsim/Dockerfile -t hikyaku-netsim .
 #   docker run --rm --privileged -v "$HOME/hikyaku-netsim-out:/tmp/netsim-out" hikyaku-netsim
