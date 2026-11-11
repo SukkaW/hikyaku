@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -174,6 +175,33 @@ func TestUDPTarget(t *testing.T) {
 			t.Fatalf("echo after a bad packet: %q, %v; want the association to carry on", payload, err)
 		}
 	})
+}
+
+func TestUDPNamesUseTheResolver(t *testing.T) {
+	v4, v6 := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")
+	o := newOutbound()
+	lookups := 0
+	answers := [][]netip.Addr{{v6}, {v4}}
+	o.dialer.resolve = func(_ context.Context, _ string, found func([]netip.Addr, time.Duration)) error {
+		lookups++
+		for _, addrs := range answers {
+			found(addrs, time.Minute)
+		}
+		return nil
+	}
+	resolved := make(map[string]netip.Addr)
+	for range 2 {
+		if to, ok := o.udpTarget(proxy.Addr{Domain: "udp.test", Port: 53}, resolved); !ok || to != netip.AddrPortFrom(v4, 53) {
+			t.Fatalf("sent to %v, %v; want the resolver's IPv4 address", to, ok)
+		}
+	}
+	if lookups != 1 {
+		t.Fatalf("%d lookups for two packets in one association, want 1", lookups)
+	}
+	answers = [][]netip.Addr{{v6}}
+	if to, ok := o.udpTarget(proxy.Addr{Domain: "v6only.test", Port: 53}, resolved); !ok || to.Addr() != v6 {
+		t.Fatalf("sent to %v, %v; want the IPv6 address of a name without IPv4", to, ok)
+	}
 }
 
 func TestResultCode(t *testing.T) {

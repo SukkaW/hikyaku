@@ -146,7 +146,7 @@ func (o *outbound) udpTarget(dst proxy.Addr, resolved map[string]netip.Addr) (ne
 		var ok bool
 		addr, ok = resolved[dst.Domain]
 		if !ok {
-			if addr, ok = resolve(dst.Domain); !ok {
+			if addr, ok = o.udpAddress(dst.Domain); !ok {
 				return netip.AddrPort{}, false
 			}
 			resolved[dst.Domain] = addr
@@ -155,12 +155,25 @@ func (o *outbound) udpTarget(dst proxy.Addr, resolved map[string]netip.Addr) (ne
 	return netip.AddrPortFrom(addr, dst.Port), true
 }
 
-func resolve(host string) (netip.Addr, bool) {
-	for _, network := range []string{"ip4", "ip6"} {
-		addrs, err := net.DefaultResolver.LookupNetIP(context.Background(), network, host)
-		if err == nil && len(addrs) > 0 {
-			return addrs[0], true
+// udpAddress resolves a UDP destination's name through the same resolver as TCP
+// dials, preferring IPv4, as the UDP socket may have no IPv6 route.
+func (o *outbound) udpAddress(host string) (netip.Addr, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	var v4, v6 netip.Addr
+	o.dialer.resolve(ctx, host, func(addrs []netip.Addr, _ time.Duration) {
+		for _, addr := range addrs {
+			switch {
+			case addr.Is4() && !v4.IsValid():
+				v4 = addr
+				cancel()
+			case addr.Is6() && !v6.IsValid():
+				v6 = addr
+			}
 		}
+	})
+	if v4.IsValid() {
+		return v4, true
 	}
-	return netip.Addr{}, false
+	return v6, v6.IsValid()
 }
