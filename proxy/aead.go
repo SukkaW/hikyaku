@@ -19,9 +19,10 @@ import (
 
 const (
 	saltSize = 32
-	maxChunk = 16 << 10
+	// maxChunk is the longest chunk a sender writes.
+	maxChunk = maxRecvChunk
 	// maxRecvChunk is the longest chunk a receiver accepts, the most a 15-bit length
-	// holds, so a sender may use longer chunks than maxChunk without a new version.
+	// holds.
 	maxRecvChunk = 1<<15 - 1
 	// readBuffer is the carrier's read buffer; a server allocates it only once the
 	// client's hello authenticates.
