@@ -70,7 +70,7 @@ brews:
     skip_upload: auto
     directory: Formula
     homepage: https://github.com/SukkaW/hikyaku
-    description: A high-performance multiplexing proxy that stays lightning fast and highly reliable everywhere, from fiber broadband to lossy in-flight Wi-Fi.
+    description: High-performance multiplexing proxy, fast and reliable even on in-flight Wi-Fi
     license: MIT
     install: |
       bin.install "hikyaku-server"
