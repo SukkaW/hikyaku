@@ -11,6 +11,8 @@
 - If a connection dies before a TLS request is answered, the request moves to a healthy one without the app noticing.
 - Short outages don't drop open connections, and traffic resumes the moment the link comes back.
 - Server restarts are graceful: open streams finish while new requests already go to the new server.
+- Encrypted DNS support for server-side
+- Smart and intelligent DNS with progressive parallelization, concurrent dialing, aggressive versions of happy eyeball v2 with simultaneous racing, optimistic caching, and more.
 
 # Protocol Specification
 
