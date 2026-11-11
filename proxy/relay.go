@@ -69,11 +69,16 @@ func abort(conn net.Conn) {
 }
 
 func copyDRS(dst io.Writer, src io.Reader) error {
-	buf := make([]byte, maxFramePayload)
+	// The buffer grows with the record-size ramp, so a connection that only ever sends
+	// small records keeps a small one.
+	buf := make([]byte, drsFirst)
 	limit := drsFirst
 	var lastWrite time.Time
 	for {
-		n, err := src.Read(buf)
+		if cap(buf) < limit {
+			buf = make([]byte, min(max(2*cap(buf), limit), maxFramePayload))
+		}
+		n, err := src.Read(buf[:limit])
 		if n > 0 {
 			if time.Since(lastWrite) > drsIdleReset {
 				limit = drsFirst

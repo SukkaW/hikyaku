@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"io"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -47,7 +49,7 @@ func checkRamp(t *testing.T, sizes []int) {
 	if !reachedMax {
 		t.Fatal("frame size never grew to the maximum")
 	}
-	// The first read fills all four, so each is exactly as many segments as its position.
+	// Each read fills one frame, so each is exactly as many segments as its position.
 	for i := range 4 {
 		if want := (i+1)*drsSegment - 42; sizes[i] != want {
 			t.Fatalf("frame %d is %d bytes, want %d", i, sizes[i], want)
@@ -69,12 +71,19 @@ func TestDRSResetsAfterIdle(t *testing.T) {
 	if err := copyDRS(w, r); err != nil {
 		t.Fatal(err)
 	}
-	// Frames never straddle reads, so the second burst starts right after 40 full reads.
-	written, idx := 0, 0
-	for idx < len(w.sizes) && written < 40*maxFramePayload {
-		written += w.sizes[idx]
-		idx++
+	// Each read is one frame, so the second burst starts at frame 40.
+	checkRamp(t, w.sizes[:40])
+	checkRamp(t, w.sizes[40:])
+}
+
+func TestDRSSmallTransferKeepsSmallBuffer(t *testing.T) {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if err := copyDRS(io.Discard, strings.NewReader("GET / HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatal(err)
 	}
-	checkRamp(t, w.sizes[:idx])
-	checkRamp(t, w.sizes[idx:])
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<10 {
+		t.Fatalf("a small transfer allocated %d bytes, want the buffer to stay at the first record size", allocated)
+	}
 }
