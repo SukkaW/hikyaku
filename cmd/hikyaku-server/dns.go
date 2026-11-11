@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,18 +27,44 @@ const (
 	upstreamTimeout = 5 * time.Second
 )
 
-// lookupOS resolves host through Go's resolver, which follows the operating system's
-// configuration and hosts file.
+// systemResolver is Go's resolver, which follows the operating system's configuration
+// and hosts file; tests point it at a fake DNS server.
+var systemResolver = net.DefaultResolver
+
+// lookupOS resolves host through Go's resolver, asking for IPv4 and IPv6 apart, so
+// a resolver that never answers one of them doesn't hold up the other.
 func lookupOS(ctx context.Context, host string, found func([]netip.Addr, time.Duration)) error {
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return err
+	type result struct {
+		addrs []netip.Addr
+		err   error
 	}
-	for i := range addrs {
-		addrs[i] = addrs[i].Unmap()
+	results := make(chan result, 2)
+	for _, network := range []string{"ip4", "ip6"} {
+		go func() {
+			addrs, err := systemResolver.LookupNetIP(ctx, network, host)
+			results <- result{addrs, err}
+		}()
 	}
-	found(addrs, noTTL)
-	return nil
+	var firstErr error
+	answered := false
+	for range 2 {
+		r := <-results
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
+		}
+		for i := range r.addrs {
+			r.addrs[i] = r.addrs[i].Unmap()
+		}
+		answered = true
+		found(r.addrs, noTTL)
+	}
+	if answered {
+		return nil
+	}
+	return firstErr
 }
 
 // dnsResolver resolves names through the DNS servers given with -dns, after the
@@ -141,33 +169,60 @@ func (r *dnsResolver) query(host string, l *sharedLookup) {
 		addrs    []netip.Addr
 		ttl      uint32
 		notFound bool
+		server   string
+		err      error // why the server gave no address
+	}
+	type exchanged struct {
+		resp *dns.Msg
+		err  error
 	}
 	replies := make(chan reply, 2*len(r.upstreams))
 	for _, u := range r.upstreams {
 		for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
 			go func() {
-				a := reply{ttl: math.MaxUint32}
-				// EDNS0's 1232-byte limit keeps larger answers from being cut at 512 bytes.
-				resp, err := u.Exchange(context.Background(), new(dns.Msg).SetQuestion(dns.Fqdn(host), qtype).SetEdns0(1232, false))
-				if err == nil {
-					a.notFound = resp.Rcode == dns.RcodeNameError
-					if resp.Rcode == dns.RcodeSuccess {
-						for _, rr := range resp.Answer {
-							a.ttl = min(a.ttl, rr.Header().Ttl)
-							if ip := proxyutil.IPFromRR(rr); ip.IsValid() {
-								a.addrs = append(a.addrs, ip.Unmap())
-							}
+				a := reply{ttl: math.MaxUint32, server: u.Address()}
+				// A plain server is retried once with a fresh timeout and without the
+				// caller's deadline, so each query is cut off here instead.
+				ctx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
+				defer cancel()
+				done := make(chan exchanged, 1)
+				go func() {
+					// EDNS0's 1232-byte limit keeps larger answers from being cut at 512 bytes.
+					resp, err := u.Exchange(ctx, new(dns.Msg).SetQuestion(dns.Fqdn(host), qtype).SetEdns0(1232, false))
+					done <- exchanged{resp, err}
+				}()
+				var res exchanged
+				select {
+				case res = <-done:
+				case <-ctx.Done():
+					res.err = ctx.Err()
+				}
+				switch resp := res.resp; {
+				case res.err != nil:
+					a.err = res.err
+				case resp.Rcode == dns.RcodeSuccess:
+					for _, rr := range resp.Answer {
+						a.ttl = min(a.ttl, rr.Header().Ttl)
+						if ip := proxyutil.IPFromRR(rr); ip.IsValid() {
+							a.addrs = append(a.addrs, ip.Unmap())
 						}
 					}
+				default:
+					a.notFound = resp.Rcode == dns.RcodeNameError
+					a.err = errors.New(dns.RcodeToString[resp.Rcode])
 				}
 				replies <- a
 			}()
 		}
 	}
 	notFound, found := false, false
+	causes := make(map[string]error) // each server's last error
 	for range cap(replies) {
 		a := <-replies
 		notFound = notFound || a.notFound
+		if a.err != nil {
+			causes[a.server] = a.err
+		}
 		if len(a.addrs) > 0 {
 			found = true
 			l.update(func() { l.answers = append(l.answers, answer{a.addrs, time.Duration(a.ttl) * time.Second}) })
@@ -182,7 +237,16 @@ func (r *dnsResolver) query(host string, l *sharedLookup) {
 	case notFound:
 		err = &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 	default:
-		err = &net.DNSError{Err: "no DNS server answered with an address", Name: host}
+		msg := "no DNS server answered with an address"
+		if len(causes) > 0 {
+			servers := slices.Sorted(maps.Keys(causes))
+			parts := make([]string, len(servers))
+			for i, server := range servers {
+				parts[i] = server + ": " + causes[server].Error()
+			}
+			msg += " (" + strings.Join(parts, "; ") + ")"
+		}
+		err = &net.DNSError{Err: msg, Name: host}
 	}
 	l.update(func() { l.done, l.err = true, err })
 }

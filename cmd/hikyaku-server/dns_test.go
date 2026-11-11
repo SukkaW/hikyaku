@@ -41,6 +41,27 @@ func fakeDNS(t *testing.T, reply func(q dns.Question) (rcode int, answer []dns.R
 	return "udp://" + pc.LocalAddr().String()
 }
 
+// quietDNS answers each question answer gives a record for and never replies to the
+// rest, returning its host:port.
+func quietDNS(t *testing.T, answer func(q dns.Question) dns.RR) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		if rr := answer(r.Question[0]); rr != nil {
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Answer = []dns.RR{rr}
+			w.WriteMsg(m)
+		}
+	})}
+	go srv.ActivateAndServe()
+	t.Cleanup(func() { srv.Shutdown() })
+	return pc.LocalAddr().String()
+}
+
 func rrA(name string, ttl uint32, ip string) dns.RR {
 	return &dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}, A: net.ParseIP(ip)}
 }
@@ -220,6 +241,48 @@ func TestDNSQueriesAdvertiseEDNS0(t *testing.T) {
 	for range 2 {
 		if size := <-sizes; size != 1232 {
 			t.Fatalf("a query advertised a %d-byte EDNS0 limit, want 1232", size)
+		}
+	}
+}
+
+func TestSystemResolverDoesNotWaitForAAAA(t *testing.T) {
+	addr := quietDNS(t, func(q dns.Question) dns.RR {
+		if q.Qtype == dns.TypeA {
+			return rrA(q.Name, 60, "192.0.2.4")
+		}
+		return nil
+	})
+	old := systemResolver
+	systemResolver = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "udp", addr)
+	}}
+	t.Cleanup(func() { systemResolver = old })
+	start := time.Now()
+	ip, ok := newOutbound().udpAddress("noaaaa.test")
+	if elapsed := time.Since(start); !ok || ip != netip.MustParseAddr("192.0.2.4") || elapsed > time.Second {
+		t.Fatalf("got %v, %v after %v; want the IPv4 address without waiting for AAAA", ip, ok, elapsed)
+	}
+}
+
+func TestDNSGivesUpOnSilentServer(t *testing.T) {
+	silent := "udp://" + quietDNS(t, func(dns.Question) dns.RR { return nil })
+	start := time.Now()
+	_, _, err := lookupAll(context.Background(), testResolver(t, "", silent), "silent.test")
+	if elapsed := time.Since(start); err == nil || elapsed > upstreamTimeout+time.Second {
+		t.Fatalf("got %v after %v; want a failure once the %v timeout passed", err, elapsed, upstreamTimeout)
+	}
+}
+
+func TestDNSFailureNamesEachServer(t *testing.T) {
+	servfail := fakeDNS(t, func(dns.Question) (int, []dns.RR, time.Duration) { return dns.RcodeServerFailure, nil, 0 })
+	refused := fakeDNS(t, func(dns.Question) (int, []dns.RR, time.Duration) { return dns.RcodeRefused, nil, 0 })
+	_, _, err := lookupAll(context.Background(), testResolver(t, "", servfail, refused), "broken.test")
+	if err == nil {
+		t.Fatal("a name no server answered resolved")
+	}
+	for _, want := range []string{"SERVFAIL", "REFUSED", strings.TrimPrefix(servfail, "udp://"), strings.TrimPrefix(refused, "udp://")} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention %q", err, want)
 		}
 	}
 }
