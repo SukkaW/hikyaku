@@ -3,6 +3,7 @@
 <p align="center">A high-performance multiplexing proxy that stays lightning fast and highly reliable everywhere,<br />from fiber broadband to lossy in-flight Wi-Fi.</p>
 
 - With **0-RTT**, every new connection saves a full round trip, especially noticeable on high-latency links like the 600 ms on satellite in-flight Wi-Fi.
+- With **dynamic record sizing**, responses start arriving sooner, especially on lossy links, while large downloads still run at full speed.
 - A **warm connection pool** has connections ready before you need them and reuses them across requests.
 - Every request takes the fastest, least busy connection, powered by **latency-aware load balancing**.
 - **Adaptive keepalives and healthchecks** keeps congestion windows open, continuously monitored for responsiveness and reliability, without consuming unnecessary resources.
@@ -23,6 +24,18 @@
 # Usage
 
 ## Install
+
+### Homebrew
+
+```sh
+brew install sukkaw/tap/hikyaku
+```
+
+### GitHub Releases
+
+Prebuilt binaries for macOS, Linux and Windows (x86-64 and ARM64) and FreeBSD (x86-64) are available on [GitHub Releases](https://github.com/SukkaW/hikyaku/releases/latest). Each archive contains both `hikyaku-server` and `hikyaku-client`.
+
+### Go
 
 Requires Go 1.27.3 or later.
 
