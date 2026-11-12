@@ -17,25 +17,23 @@
 > [!NOTE]
 > hikyaku is designed for network acceleration and reliability improvements. Circumventing censorship was not, is not, and will never be, part of hikyaku's design goals.
 
-# Protocol Specification
+## Protocol Specification
 
 [PROTOCOL.md](PROTOCOL.md)
 
-# Usage
-
 ## Install
 
-### Homebrew
+**Homebrew**
 
 ```sh
 brew install sukkaw/tap/hikyaku
 ```
 
-### GitHub Releases
+**GitHub Releases**
 
 Prebuilt binaries for macOS, Linux and Windows (x86-64 and ARM64) and FreeBSD (x86-64) are available on [GitHub Releases](https://github.com/SukkaW/hikyaku/releases/latest). Each archive contains both `hikyaku-server` and `hikyaku-client`.
 
-### Go
+**Go**
 
 Requires Go 1.27.3 or later.
 
@@ -44,7 +42,9 @@ go install github.com/SukkaW/hikyaku/cmd/hikyaku-server@latest
 go install github.com/SukkaW/hikyaku/cmd/hikyaku-client@latest
 ```
 
-## Server
+## Usage
+
+**Server**
 
 Run the server on a host the client can reach over TCP. Any string works as the pre-shared key.
 
@@ -63,7 +63,7 @@ hikyaku-server -listen ':8444' -psk 'your-psk' -dns 'https://1.1.1.1/dns-query' 
 
 On Linux, the server uses BBR congestion control when the kernel has BBR and either the server runs as root, or `bbr` is the system default or listed in `net.ipv4.tcp_allowed_congestion_control`. Otherwise it logs a warning for each client connection and uses the system default.
 
-## Client
+**Client**
 
 The client exposes a local SOCKS5 proxy, supporting both TCP (`CONNECT`) and UDP (`UDP ASSOCIATE`).
 
@@ -84,7 +84,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 | `-psk`      | (required)       | Pre-shared key, the same as the server's                        |
 | `-carriers` | `4`              | Maximum number of active connections to the server (at least 1) |
 
-## Surge for Mac
+**Surge for Mac**
 
 Installing the hikyaku client with [Homebrew](#homebrew) is recommended. Surge can then start hikyaku client as an [External Proxy Program](https://manual.nssurge.com/policies/external.html):
 
@@ -98,7 +98,7 @@ hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen",
 - `addresses` takes the server's IP address, not a hostname.
 - `udp-relay = true` allows hikyaku to relay Surge's UDP traffic as well.
 
-# Benchmark
+## Benchmark
 
 - hikyaku v0.1.0, [TUIC](https://github.com/Itsusinn/tuic) v2.0.0-dev10, [satmux](https://github.com/Th0rgal/satmux) `2922ebb`, and a direct connection without a proxy.
 - Congestion control is cubic for all four, since the test kernel has no BBR; TUIC, which defaults to BBR, is set to cubic on both ends. hikyaku runs with `-carriers 4` and satmux with `--carriers 12`, their defaults.
@@ -117,7 +117,7 @@ hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen",
 | `starlink`         | Starlink continental: 30 ms, 0.02% loss each way, 125/15 Mbit/s, cabin spikes, 15 s pauses |
 | `starlink-oceanic` | Starlink oceanic: 65 ms, 0.02% loss each way, ~1 s blackout every ~10 min, 65/24 Mbit/s    |
 
-## First request after the client starts (ms)
+**First request after the client starts (ms)**
 
 ![First request after the client starts](docs/benchmark/cold_s.svg)
 
@@ -133,7 +133,7 @@ hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen",
 | `starlink`         |      160 |     250 |    420 | **150** |
 | `starlink-oceanic` |  **220** |     325 |    545 |     290 |
 
-## Slowest of 6 parallel small HTTPS requests (ms)
+**Slowest of 6 parallel small HTTPS requests (ms)**
 
 ![Slowest of 6 parallel small HTTPS requests](docs/benchmark/burst_max_s.svg)
 
@@ -149,7 +149,7 @@ hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen",
 | `starlink`         |  **120** |      137 |  **120** |    136 |
 | `starlink-oceanic` |  **187** |      227 |      190 |    275 |
 
-## Small HTTPS request during a download (ms)
+**Small HTTPS request during a download (ms)**
 
 ![Small HTTPS request during a download](docs/benchmark/loaded_median_s.svg)
 
@@ -165,7 +165,7 @@ hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen",
 | `starlink`         |  **116** |  117 |  **116** |    134 |
 | `starlink-oceanic` |  **145** |  212 |      187 |    304 |
 
-## 100 KB HTTPS response after 5 s idle, time to first byte (ms)
+**100 KB HTTPS response after 5 s idle, time to first byte (ms)**
 
 ![100 KB HTTPS response after 5 s idle, time to first byte](docs/benchmark/after_idle_ttfb_s.svg)
 
@@ -181,7 +181,7 @@ hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen",
 | `starlink`         |   **75** | **75** |     107 |    104 |
 | `starlink-oceanic` |      143 |    160 | **142** |    208 |
 
-## 100 KB HTTPS response after 5 s idle, total (ms)
+**100 KB HTTPS response after 5 s idle, total (ms)**
 
 ![100 KB HTTPS response after 5 s idle, total](docs/benchmark/after_idle_s.svg)
 
@@ -197,7 +197,7 @@ hikyaku = external, exec = "/opt/homebrew/bin/hikyaku-client", args = "-listen",
 | `starlink`         |      169 |  **122** |    171 |      199 |
 | `starlink-oceanic` |      342 |  **202** |    342 |      407 |
 
-## Download (Mbit/s)
+**Download (Mbit/s)**
 
 ![Download](docs/benchmark/bulk_mbps.svg)
 
@@ -215,7 +215,7 @@ Median of 3 downloads per run, each sized to 8 s at the link's download cap, bet
 | `starlink`         |    95.8 |  **113** |   96.0 |      92.0 |
 | `starlink-oceanic` |    48.6 | **57.3** |   49.1 |      47.1 |
 
-## Failed requests
+**Failed requests**
 
 Out of 110 per system and profile: 10 first requests, 60 parallel requests, 30 requests during a download, 10 responses after idle.
 
@@ -231,7 +231,7 @@ Out of 110 per system and profile: 10 first requests, 60 parallel requests, 30 r
 | `starlink`         |       0 |    0 |      0 |      0 |
 | `starlink-oceanic` |       0 |    0 |      0 |      0 |
 
-# License
+## License
 
 [MIT](LICENSE)
 
