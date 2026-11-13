@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -256,6 +257,41 @@ func TestPingInterval(t *testing.T) {
 		if got := pingInterval(c.sinceData, c.sinceStream, c.streams); got != c.want {
 			t.Errorf("%s: %s, want %s", c.name, got, c.want)
 		}
+	}
+}
+
+// A write to a stream the server reset fails as a reset, so the relay ends the app's
+// connection without sending a RESET back.
+func TestWriteAfterResetIsReset(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	client, err := smux.Client(clientConn, proxy.MuxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := smux.Server(serverConn, proxy.MuxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	st, err := client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go server.AcceptStream()
+	c := &carrier{}
+	s := c.newStream(st)
+	c.control(proxy.CtrlReset, proxy.ResetBody(st.ID(), proxy.ResetAborted))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := s.Write([]byte("late"))
+		if errors.Is(err, proxy.ErrReset) {
+			return
+		}
+		if err != nil || time.Now().After(deadline) {
+			t.Fatalf("write after RESET: %v, want proxy.ErrReset", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

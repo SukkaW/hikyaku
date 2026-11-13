@@ -242,8 +242,8 @@ func (s *streams) reset(id uint32) {
 	s.early[id] = now
 }
 
-// resettable is a stream whose Abort resets the client's end too, and whose reads
-// fail with proxy.ErrReset once the client resets it.
+// resettable is a stream whose Abort resets the client's end too, and whose reads and
+// writes fail with proxy.ErrReset once the client resets it.
 type resettable struct {
 	*smux.Stream
 	conn  *proxy.Conn
@@ -259,6 +259,15 @@ func (s *resettable) Abort() {
 
 func (s *resettable) Read(b []byte) (int, error) {
 	n, err := s.Stream.Read(b)
+	if err != nil && s.reset.Load() {
+		err = proxy.ErrReset
+	}
+	return n, err
+}
+
+// Write reports a reset as the reset it is, so the relay does not send a RESET back.
+func (s *resettable) Write(b []byte) (int, error) {
+	n, err := s.Stream.Write(b)
 	if err != nil && s.reset.Load() {
 		err = proxy.ErrReset
 	}

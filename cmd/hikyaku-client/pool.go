@@ -781,7 +781,7 @@ type carrierStream struct {
 	opened    time.Time
 	requested atomic.Int64 // unix nanoseconds of the first write, which carries the request
 	answered  bool         // only touched by the single reader
-	reset     atomic.Bool  // the server reset the stream; its reads then fail with proxy.ErrReset
+	reset     atomic.Bool  // the server reset the stream; its reads and writes then fail with proxy.ErrReset
 }
 
 func (c *carrier) newStream(s *smux.Stream) *carrierStream {
@@ -801,7 +801,12 @@ func (c *carrier) newStream(s *smux.Stream) *carrierStream {
 
 func (s *carrierStream) Write(b []byte) (int, error) {
 	s.requested.CompareAndSwap(0, time.Now().UnixNano())
-	return s.Stream.Write(b)
+	n, err := s.Stream.Write(b)
+	// Reported as the reset it is, so the relay does not send a RESET back.
+	if err != nil && s.reset.Load() {
+		err = proxy.ErrReset
+	}
+	return n, err
 }
 
 func (s *carrierStream) Read(b []byte) (n int, err error) {
