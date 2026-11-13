@@ -548,10 +548,14 @@ func TestGoAwayStandsBy(t *testing.T) {
 	if reason := p.standing()[0].goaway.Load(); reason == nil || *reason != "test" {
 		t.Fatalf("standby carrier's GOAWAY reason %v, want the server's", reason)
 	}
-	// A server that is shutting down gets its successor's carrier after a back-off.
-	time.Sleep(500 * time.Millisecond)
-	if n := carriers.Load(); n != 1 {
-		t.Fatalf("%d carriers within 500 ms of GOAWAY, want 1", n)
+	// The successor of a server that is shutting down may already be listening, so the
+	// slot redials at once instead of after a back-off.
+	deadline := time.Now().Add(minBackoff / 2)
+	for carriers.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no redial within %s of GOAWAY, want one at once", minBackoff/2)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

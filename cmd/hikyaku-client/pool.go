@@ -177,9 +177,11 @@ func (p *pool) maintain(slot int) {
 			log.Printf("carrier %d: closed after %s: %s", slot, c.lifetime(), c.closeReason())
 		}
 		// With 0-RTT a dial succeeds before the server answers, so a carrier it never
-		// acknowledged, such as one with the wrong PSK, counts as a failed dial; so does
-		// one sent away by a server that is shutting down, so redials await its successor.
-		if c.conn.Acked() && v != goingAway {
+		// acknowledged, such as one with the wrong PSK, counts as a failed dial. One sent
+		// away by a server that is shutting down is redialed at once, as its successor may
+		// already be listening; the old server closed its listener first, so it is not
+		// reached again, and a refused dial backs off.
+		if c.conn.Acked() {
 			backoff = 0
 		} else {
 			backoff = min(max(2*backoff, minBackoff), maxBackoff)
