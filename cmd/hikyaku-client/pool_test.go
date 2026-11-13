@@ -108,6 +108,69 @@ func TestPoolWarm(t *testing.T) {
 	}
 }
 
+// A carrier that fails to open a stream after it was picked hands the request to the
+// next usable one instead of failing it.
+func TestOpenStreamRetriesAnotherCarrier(t *testing.T) {
+	psk := "open-retry-test"
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { silent.Close() })
+	go func() {
+		for {
+			conn, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { conn.Close() })
+		}
+	}()
+	broken, err := newPool(silent.Addr().String(), []byte(psk), 1).dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer broken.session.Close()
+	// Its writes now fail while its reads, and so the carrier, stay up.
+	broken.conn.Conn.(*net.TCPConn).CloseWrite()
+
+	p := newPool(startServer(t, psk), []byte(psk), 2)
+	p.opened = 2 // the test supplies the carriers itself
+	p.set(0, broken)
+	type opened struct {
+		c   *carrier
+		err error
+	}
+	done := make(chan opened, 1)
+	go func() {
+		c, s, err := p.openStream()
+		if err == nil {
+			s.Close()
+		}
+		done <- opened{c, err}
+	}()
+	good, err := p.dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer good.session.Close()
+	good.slot = 1
+	waitFor(t, "the good carrier acknowledged", good.conn.Acked)
+	time.Sleep(100 * time.Millisecond) // so the broken carrier is tried first
+	p.set(1, good)
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatalf("openStream failed with %v, want the stream on the good carrier", o.err)
+		}
+		if o.c != good {
+			t.Fatalf("stream opened on carrier %d, want the good one", o.c.slot)
+		}
+	case <-time.After(carrierWait):
+		t.Fatal("openStream never returned")
+	}
+}
+
 // A burst that arrives while the first carrier is still connecting, as when Surge
 // starts the client and sends requests at once, waits for it instead of failing.
 func TestPoolWarmBurst(t *testing.T) {

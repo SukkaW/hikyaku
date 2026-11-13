@@ -639,11 +639,10 @@ func (p *pool) openStream() (*carrier, *carrierStream, error) {
 		changed := p.changed
 		p.mu.Unlock()
 		if c := p.pick(); c != nil {
-			s, err := c.session.OpenStream()
-			if err != nil {
-				return nil, nil, err
+			// One that failed since it was picked waits for another, like one not ready yet.
+			if s, err := c.session.OpenStream(); err == nil {
+				return c, c.newStream(s), nil
 			}
-			return c, c.newStream(s), nil
 		}
 		select {
 		case <-changed:
