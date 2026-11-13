@@ -101,6 +101,11 @@ func (d *raceDialer) DialContext(ctx context.Context, dst proxy.Addr) (net.Conn,
 	r.add(cached.addrs)
 	conn, winner, err := r.wait()
 	if conn == nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// The caller gave up, so the lookup's error, which may take until the
+			// deadline, has no one to reach.
+			return nil, err
+		}
 		lookupErr := <-looked
 		if len(r.tried) == 0 {
 			if lookupErr != nil {
@@ -222,7 +227,8 @@ func (r *race) waitFor(delay time.Duration) (net.Conn, netip.Addr, bool) {
 }
 
 // wait returns the first connection to complete, taking in a running lookup's
-// addresses as they arrive, or every attempt's error once nothing is left to try.
+// addresses as they arrive, or every attempt's error once nothing is left to try or
+// the race's context ends.
 func (r *race) wait() (net.Conn, netip.Addr, error) {
 	for r.pending > 0 || r.more != nil {
 		select {
@@ -236,6 +242,10 @@ func (r *race) wait() (net.Conn, netip.Addr, error) {
 				continue
 			}
 			r.add(addrs)
+		case <-r.ctx.Done():
+			// Attempts still running end with the context and are closed if they connect.
+			go resetLosers(r.results, r.pending)
+			return nil, netip.Addr{}, errors.Join(append(r.errs, r.ctx.Err())...)
 		}
 	}
 	return nil, netip.Addr{}, errors.Join(r.errs...)

@@ -41,6 +41,16 @@ func (o *outbound) handle(stream net.Conn) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	if s, ok := stream.(interface{ GetDieCh() <-chan struct{} }); ok {
+		// A stream the client reset meanwhile needs no destination.
+		go func() {
+			select {
+			case <-s.GetDieCh():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	conn, err := o.dialer.DialContext(ctx, destination)
 	cancel()
 	if err != nil {

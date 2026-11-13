@@ -127,6 +127,62 @@ func readReplies(t testing.TB, stream io.Reader) {
 	}
 }
 
+// A stream the client resets while its destination is still being dialed, which the
+// server answers by closing the stream, ends that dial instead of letting it run on.
+func TestResetStreamStopsDial(t *testing.T) {
+	out := newOutbound()
+	asked := make(chan struct{}, 1)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	out.dialer.resolve = func(context.Context, string, func([]netip.Addr, time.Duration)) error {
+		asked <- struct{}{}
+		<-release
+		return errors.New("never resolves")
+	}
+	clientConn, serverConn := net.Pipe()
+	client, err := smux.Client(clientConn, proxy.MuxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := smux.Server(serverConn, proxy.MuxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	stream, err := client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := proxy.AppendConnect(nil, proxy.Addr{Domain: "unresolved.test", Port: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled := make(chan struct{})
+	go func() {
+		out.handle(&resettable{Stream: accepted})
+		close(handled)
+	}()
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the destination was never looked up")
+	}
+	accepted.Close()
+	select {
+	case <-handled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the dial kept running after its stream closed")
+	}
+}
+
 func TestUDPTarget(t *testing.T) {
 	echo, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
