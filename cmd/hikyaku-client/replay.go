@@ -71,13 +71,15 @@ func (r *replayStream) attach() error {
 			s.Close()
 			return err
 		}
-	} else {
-		r.request = request
-		r.flush = time.AfterFunc(requestDelay, r.flushRequest)
 	}
 	r.stream.Store(s)
 	r.carrier.Store(c)
 	r.moving.Store(false)
+	if len(r.sent) == 0 {
+		// Armed only once the stream is stored, since flushRequest writes to it.
+		r.request = request
+		r.flush = time.AfterFunc(requestDelay, r.flushRequest)
+	}
 	if r.replayable.Load() {
 		c.track(r)
 	}
