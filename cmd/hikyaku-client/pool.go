@@ -258,6 +258,12 @@ func (c *carrier) down() bool {
 	return c.session.IsClosed() || c.conn.ReadErr() != nil
 }
 
+// usable reports whether c may take new streams: it is up and its server has not sent
+// GOAWAY, after which no new stream may open on it.
+func (c *carrier) usable() bool {
+	return !c.down() && c.goaway.Load() == nil
+}
+
 // control handles the server's control messages on the carrier's reading goroutine.
 func (c *carrier) control(cmd byte, body []byte) {
 	switch cmd {
@@ -666,9 +672,7 @@ func (p *pool) pick() *carrier {
 		// A standby carrier takes new streams only once it answers pings or delivers
 		// data again; that proves more than a new carrier still waiting for its
 		// acknowledgement. One the server is closing never does.
-		best = fewestStreams(p.standby, func(c *carrier) bool {
-			return !c.unresponsive(c.replyDeadline()) && c.goaway.Load() == nil
-		})
+		best = fewestStreams(p.standby, func(c *carrier) bool { return !c.unresponsive(c.replyDeadline()) })
 	}
 	if best == nil {
 		best = fewestStreams(p.carriers, nil)
@@ -693,7 +697,7 @@ func (p *pool) spare(c *carrier) bool {
 func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 	var best *carrier
 	for _, c := range carriers {
-		if c == nil || c.down() || (eligible != nil && !eligible(c)) {
+		if c == nil || !c.usable() || (eligible != nil && !eligible(c)) {
 			continue
 		}
 		if best == nil || c.session.NumStreams() < best.session.NumStreams() {
@@ -711,7 +715,7 @@ func quickest(carriers []*carrier) *carrier {
 	var waits []time.Duration
 	var streams []int
 	for _, c := range carriers {
-		if c == nil || c.down() || !c.conn.Acked() || c.goaway.Load() != nil {
+		if c == nil || !c.usable() || !c.conn.Acked() {
 			continue
 		}
 		acked = append(acked, c)

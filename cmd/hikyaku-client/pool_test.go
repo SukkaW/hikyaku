@@ -76,6 +76,25 @@ func TestQuickestSkipsGoingAway(t *testing.T) {
 	}
 }
 
+// A carrier whose server is going away takes no new stream even when nothing else is
+// left, such as before its acknowledgement or before watch moves it to standby.
+func TestPickSkipsGoingAway(t *testing.T) {
+	psk := "goaway-fallback-test"
+	p := newPool(startServer(t, psk), []byte(psk), 1)
+	p.opened = 1 // the test supplies the carrier itself, so no health check moves it
+	c, err := p.dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.session.Close()
+	p.set(0, c)
+	reason := "test"
+	c.goaway.Store(&reason)
+	if got := p.pick(); got != nil {
+		t.Fatalf("picked carrier %d, whose server is going away", got.slot)
+	}
+}
+
 func TestPoolWarm(t *testing.T) {
 	psk := "warm-pool-test"
 	p := newPool(startServer(t, psk), []byte(psk), 4)
