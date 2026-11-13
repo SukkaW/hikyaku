@@ -266,7 +266,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 		err := c.awaitAck()
 		var p []byte
 		if err == nil {
-			p, err = c.readChunk()
+			p, err = c.readChunk(true)
 		}
 		if err != nil {
 			// smux ends streams with frames of its own, so the carrier itself ending,
@@ -302,7 +302,7 @@ func (c *Conn) awaitAck() error {
 		return err
 	}
 	c.open = open
-	ack, err := c.readChunk()
+	ack, err := c.readChunk(false)
 	if err != nil {
 		return fmt.Errorf("read server acknowledgement: %w", err)
 	}
@@ -342,8 +342,8 @@ func (c *Conn) writeWithPrefix(prefix, b []byte, flag uint16) error {
 }
 
 // readChunk returns the next chunk of smux data, handing control messages that
-// arrive before it to the control handler.
-func (c *Conn) readChunk() ([]byte, error) {
+// arrive before it to the control handler, or failing on one unless controlAllowed.
+func (c *Conn) readChunk(controlAllowed bool) ([]byte, error) {
 	overhead := c.open.Overhead()
 	if cap(c.rbuf) < maxRecvChunk+overhead {
 		c.rbuf = make([]byte, maxRecvChunk+overhead)
@@ -381,6 +381,9 @@ func (c *Conn) readChunk() ([]byte, error) {
 		if !control {
 			c.lastData.Store(now)
 			return plain, nil
+		}
+		if !controlAllowed {
+			return nil, errors.New("unexpected control message")
 		}
 		if c.control != nil {
 			c.control(plain[0], plain[1:])

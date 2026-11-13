@@ -411,3 +411,46 @@ func TestControlMessages(t *testing.T) {
 	exchange(client, server, CtrlPing, atServer)
 	exchange(server, client, CtrlPong, atClient)
 }
+
+// The server's acknowledgement must be its first chunk, so a control message ahead of
+// it fails the handshake instead of reaching the control handler.
+func TestControlBeforeAckRejected(t *testing.T) {
+	psk := newPSK()
+	clientRaw, serverRaw := tcpPair(t)
+	client, err := ClientHandshake(clientRaw, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled := make(chan byte, 1)
+	client.OnControl(func(cmd byte, _ []byte) { handled <- cmd })
+	go func() {
+		s := newConn(serverRaw)
+		clientSalt := make([]byte, saltSize)
+		if _, err := io.ReadFull(serverRaw, clientSalt); err != nil {
+			return
+		}
+		s.open, _ = newAEAD(psk, clientSalt, "hikyaku c2s")
+		if _, err := s.readHello(); err != nil {
+			return
+		}
+		serverSalt := make([]byte, saltSize)
+		rand.Read(serverSalt)
+		s.seal, _ = newAEAD(psk, append(serverSalt, clientSalt...), "hikyaku s2c")
+		s.writeWithPrefix(serverSalt, []byte{CtrlGoAway, GoAwayShutdown, 0}, controlFlag)
+		s.writeWithPrefix(nil, []byte{helloVersion}, 0)
+	}()
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = client.Read(make([]byte, 1))
+	var netErr net.Error
+	if err == nil || errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("read %v, want the handshake to fail", err)
+	}
+	if client.Acked() {
+		t.Fatal("acknowledged after a control message came first")
+	}
+	select {
+	case cmd := <-handled:
+		t.Fatalf("control handler ran for command %d before the acknowledgement", cmd)
+	default:
+	}
+}
